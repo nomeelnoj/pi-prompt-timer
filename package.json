@@ -1,0 +1,56 @@
+{
+  "name": "pi-prompt-timer",
+  "version": "0.1.0",
+  "description": "Live prompt-timing extension for pi coding agent — shows elapsed thinking time and an idle timer that warns at the 5-minute cache TTL.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "timer",
+    "prompt-cache",
+    "status"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nomeelnoj/pi-prompt-timer.git"
+  },
+  "homepage": "https://github.com/nomeelnoj/pi-prompt-timer#readme",
+  "bugs": {
+    "url": "https://github.com/nomeelnoj/pi-prompt-timer/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "extensions/prompt-timer/index.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/prompt-timer/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "verify-package": "node scripts/verify-package.mjs",
+    "smoke-package": "node scripts/smoke-package.mjs",
+    "check": "npm run typecheck && npm run verify-package && npm run smoke-package"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-tui": "0.84.4",
+    "@types/node": "22.20.1",
+    "jiti": "2.7.0",
+    "typescript": "7.0.2"
+  }
+}
