@@ -138,3 +138,11 @@ Pi loads the TypeScript source extension directly. The npm tarball contains only
 ## License
 
 MIT
+
+## Credits
+
+This package's repository conventions — the CI `check` gate, the package-content verification and clean-install smoke
+test (`scripts/`), the GitHub Actions CI/publish workflows, and the community-health files — follow the pattern
+established by [pi-copy-code](https://github.com/penumbral-labs/pi-copy-code) by Aaron Small (MIT), reimplemented and
+adapted for this package. A few conventional config files (`.github/dependabot.yml`, `.gitignore`, and the
+`.claude/CLAUDE.md` → `AGENTS.md` import) are the ecosystem-standard boilerplate shared with that project.
