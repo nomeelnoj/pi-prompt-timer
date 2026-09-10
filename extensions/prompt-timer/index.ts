@@ -4,13 +4,25 @@
  * SURFACES
  *   Footer (always visible, live-ticking every second)
  *     • Thinking  →  ⏱  1:23  started 14:32:05
- *     • Idle      →  ⌛ 4:32  · cache expires in 0:28  @14:33:28  last: 15s
- *     • Idle ≥5m  →  red  ⚠ cache expired
+ *     • Idle      →  ⌛ 4:32  · cache TTL expires in 0:28  @14:33:28  last: 15s
+ *     • Idle ≥5m  →  red  ⚠ cache TTL expired
+ *
+ *   Title bar (only while a blocking prompt/overlay is open)
+ *     The footer is occluded by prompt overlays (e.g. ask_user_question), so the
+ *     cache-TTL countdown is mirrored into the terminal title bar, which no
+ *     overlay can cover. Gated by MIRROR_TO_TITLE_DURING_PROMPTS.
  *
  *   /timer command  +  ctrl+alt+t shortcut
  *     Opens a history overlay showing every turn's agent-response time with
- *     idle gaps > 30 s flagged as "waiting" rows.
+ *     idle gaps > 30 s flagged as "waiting" rows (red past the cache TTL).
  *     Press → or w to write the history to a Markdown file.
+ *
+ * CACHE MODEL
+ *   The prompt cache is server-side state whose TTL counts down from the last
+ *   request that touched it. Any gap with no API traffic — idle at the prompt, a
+ *   long-running tool, or a human-input wait (ask_user_question) — expires it
+ *   identically. So the countdown is anchored to the last completed provider
+ *   response (last assistant message end), not to agent-idle state.
  */
 
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -30,6 +42,14 @@ import * as nodePath from "node:path";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_WARN_MS = 4 * 60 * 1000;
+
+/**
+ * Mirror the cache-TTL countdown into the terminal title bar while a blocking
+ * prompt (ask_user_question, confirm, select, input, custom overlay) is open.
+ * The footer is occluded by such overlays, but the title bar is never covered.
+ * Set to false to disable all title-bar writes.
+ */
+const MIRROR_TO_TITLE_DURING_PROMPTS = true;
 
 /** Idle gaps longer than this appear as an explicit "waiting" row in the history. */
 const WAIT_THRESHOLD_MS = 30 * 1000;
@@ -76,6 +96,27 @@ function formatDuration(ms: number): string {
 function formatTimestamp(ms: number): string {
   const d = new Date(ms);
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+type CacheLevel = "dim" | "warning" | "error";
+
+/**
+ * Cache-TTL countdown text + severity, anchored to the last completed provider
+ * response. The prompt cache is server-side state whose TTL counts down from the
+ * last request that touched it, regardless of whether the client is idle, running
+ * a long tool, or blocked waiting for a human answer.
+ */
+function cacheCountdown(sinceMs: number, now: number): { text: string; level: CacheLevel } {
+  const elapsed = Math.max(0, now - sinceMs);
+  const dur = formatDuration(elapsed);
+  if (elapsed >= CACHE_TTL_MS) {
+    return { text: `⌛ ${dur}  ⚠ cache TTL expired`, level: "error" };
+  }
+  if (elapsed >= CACHE_WARN_MS) {
+    const rem = formatDuration(Math.max(0, CACHE_TTL_MS - elapsed));
+    return { text: `⌛ ${dur}  · cache TTL expires in ${rem}`, level: "warning" };
+  }
+  return { text: `⌛ ${dur}`, level: "dim" };
 }
 
 function truncatePrompt(text: string): string {
@@ -419,20 +460,51 @@ async function writeHistoryFile(
 export default function promptTimer(pi: ExtensionAPI) {
   // ── State ─────────────────────────────────────────────────────────────────
   let thinkingStartMs: number | null = null;
-  let idleStartMs: number | null = null;
   let lastRunMs: number | null = null;
-  let lastResponseAt: number | null = null;
+  // Anchor for the cache-TTL countdown: when the last provider response
+  // completed (last assistant message end). Ticks down during idle, long tool
+  // runs, and human-input waits (ask_user_question) alike.
+  let lastProviderResponseAt: number | null = null;
   let pendingPromptText = "";
   let pendingInputAt: number | null = null;
+  // True while a blocking user-facing prompt/overlay is open.
+  let uiPromptActive = false;
 
   let footerTui: { requestRender(): void } | null = null;
+  let titleUi: { setTitle(t: string): void } | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+
+  // ── Title-bar helpers ───────────────────────────────────────────────────────
+
+  function baseTitle(): string {
+    const cwd = nodePath.basename(process.cwd());
+    const name = pi.getSessionName();
+    return name ? `π - ${name} - ${cwd}` : `π - ${cwd}`;
+  }
+
+  /** Paint the cache-TTL countdown into the title while a prompt is open. */
+  function refreshPromptTitle(): void {
+    if (!titleUi) return;
+    if (lastProviderResponseAt === null) {
+      titleUi.setTitle(baseTitle());
+      return;
+    }
+    const st = cacheCountdown(lastProviderResponseAt, Date.now());
+    titleUi.setTitle(`${st.text}  ·  ${baseTitle()}`);
+  }
+
+  function restoreTitle(): void {
+    if (titleUi) titleUi.setTitle(baseTitle());
+  }
 
   // ── Tick loop ──────────────────────────────────────────────────────────────
 
   function startTick(): void {
     if (tickTimer !== null) return;
-    tickTimer = setInterval(() => footerTui?.requestRender(), 1000);
+    tickTimer = setInterval(() => {
+      footerTui?.requestRender();
+      if (MIRROR_TO_TITLE_DURING_PROMPTS && uiPromptActive) refreshPromptTitle();
+    }, 1000);
   }
 
   function stopTick(): void {
@@ -498,27 +570,48 @@ export default function promptTimer(pi: ExtensionAPI) {
 
   pi.on("input", async (event) => {
     if (event.source === "extension") return;
-    const now = Date.now();
     pendingPromptText = truncatePrompt(event.text);
-    pendingInputAt = now;
-    idleStartMs = null;
+    pendingInputAt = Date.now();
   });
 
   pi.on("agent_start", async () => {
     if (thinkingStartMs === null) thinkingStartMs = Date.now();
-    idleStartMs = null;
     footerTui?.requestRender();
     startTick();
+  });
+
+  // Last provider round-trip completed — the moment the cache was (re)written.
+  // Fires before tool execution, so an ask_user_question wait is anchored here.
+  pi.on("message_end", async (event) => {
+    if (event.message.role === "assistant") {
+      lastProviderResponseAt = Date.now();
+    }
+  });
+
+  // Blocking user-facing prompt opened/closed (ask_user_question, confirm,
+  // select, input, custom overlay). Mirror the cache countdown into the title
+  // bar since the footer is occluded by the overlay.
+  pi.on("ui_prompt_start", async (_event, ctx) => {
+    uiPromptActive = true;
+    if (MIRROR_TO_TITLE_DURING_PROMPTS && ctx.hasUI) {
+      titleUi = ctx.ui;
+      refreshPromptTitle();
+      startTick();
+    }
+  });
+
+  pi.on("ui_prompt_end", async () => {
+    uiPromptActive = false;
+    if (MIRROR_TO_TITLE_DURING_PROMPTS) restoreTitle();
   });
 
   pi.on("agent_settled", async () => {
     const now = Date.now();
     if (thinkingStartMs !== null && pendingInputAt !== null) {
       lastRunMs = now - thinkingStartMs;
-      lastResponseAt = now;
     }
+    if (lastProviderResponseAt === null) lastProviderResponseAt = now;
     thinkingStartMs = null;
-    idleStartMs = now;
     pendingInputAt = null;
     footerTui?.requestRender();
     startTick();
@@ -527,25 +620,24 @@ export default function promptTimer(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     // Reset ephemeral per-turn state.
     thinkingStartMs = null;
-    idleStartMs = null;
     lastRunMs = null;
-    lastResponseAt = null;
+    lastProviderResponseAt = null;
     pendingPromptText = "";
     pendingInputAt = null;
+    uiPromptActive = false;
 
-    // Restore the idle timer from the transcript so /reload (which preserves
-    // context, hence the live prompt cache) keeps showing the cache-TTL clock.
+    // Restore the cache anchor from the transcript so /reload (which preserves
+    // context, hence the live prompt cache) keeps the cache-TTL clock ticking.
     // A genuinely new session has no turns, so the footer stays empty (—).
     const turns = reconstructHistory(ctx.sessionManager.getEntries());
     const lastTurn = turns[turns.length - 1];
     if (lastTurn) {
-      const lastActivityMs = lastTurn.at + lastTurn.durationMs;
-      idleStartMs = lastActivityMs;
-      lastResponseAt = lastActivityMs;
+      lastProviderResponseAt = lastTurn.at + lastTurn.durationMs;
       lastRunMs = lastTurn.durationMs;
     }
 
     if (!ctx.hasUI) return;
+    titleUi = ctx.ui;
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       footerTui = tui;
@@ -559,23 +651,17 @@ export default function promptTimer(pi: ExtensionAPI) {
           const now = Date.now();
           let left: string;
 
-          if (thinkingStartMs !== null) {
+          if (thinkingStartMs !== null && !uiPromptActive) {
+            // Agent actively working (not blocked on a human prompt).
             const elapsed = now - thinkingStartMs;
             left = theme.fg("accent", `⏱  ${formatDuration(elapsed)}  started ${formatTimestamp(thinkingStartMs)}`);
-          } else if (idleStartMs !== null) {
-            const elapsed = now - idleStartMs;
-            const dur = formatDuration(elapsed);
-            const remaining = CACHE_TTL_MS - elapsed;
-            if (elapsed >= CACHE_TTL_MS) {
-              left = theme.fg("error", `⌛ ${dur}  ⚠ cache TTL expired`);
-            } else if (elapsed >= CACHE_WARN_MS) {
-              left = theme.fg("warning", `⌛ ${dur}  · cache TTL expires in ${formatDuration(Math.max(0, remaining))}`);
-            } else {
-              left = theme.fg("dim", `⌛ ${dur}`);
-            }
-            if (lastResponseAt !== null) {
-              left += theme.fg("dim", `  @${formatTimestamp(lastResponseAt)}`);
-            }
+          } else if (lastProviderResponseAt !== null) {
+            // Idle at prompt, long tool run, or waiting on a human answer — all
+            // expire the cache identically, so show the countdown from the last
+            // provider response.
+            const st = cacheCountdown(lastProviderResponseAt, now);
+            left = theme.fg(st.level, st.text);
+            left += theme.fg("dim", `  @${formatTimestamp(lastProviderResponseAt)}`);
           } else {
             left = theme.fg("dim", "—");
           }
@@ -598,8 +684,12 @@ export default function promptTimer(pi: ExtensionAPI) {
     stopTick();
     footerTui = null;
     thinkingStartMs = null;
-    idleStartMs = null;
-    if (ctx.hasUI) ctx.ui.setFooter(undefined);
+    uiPromptActive = false;
+    if (ctx.hasUI) {
+      ctx.ui.setFooter(undefined);
+      if (MIRROR_TO_TITLE_DURING_PROMPTS) ctx.ui.setTitle(baseTitle());
+    }
+    titleUi = null;
   });
 
   // ── Commands & shortcuts ───────────────────────────────────────────────────
