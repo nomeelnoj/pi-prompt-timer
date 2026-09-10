@@ -35,9 +35,10 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
     "verify-package": "node scripts/verify-package.mjs",
     "smoke-package": "node scripts/smoke-package.mjs",
-    "check": "npm run typecheck && npm run verify-package && npm run smoke-package"
+    "check": "npm run typecheck && npm test && npm run verify-package && npm run smoke-package"
   },
   "publishConfig": {
     "access": "public"

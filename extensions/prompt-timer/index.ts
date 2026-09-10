@@ -83,7 +83,7 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-function formatDuration(ms: number): string {
+export function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -93,7 +93,7 @@ function formatDuration(ms: number): string {
   return `${sec}s`;
 }
 
-function formatTimestamp(ms: number): string {
+export function formatTimestamp(ms: number): string {
   const d = new Date(ms);
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
@@ -106,7 +106,7 @@ type CacheLevel = "dim" | "warning" | "error";
  * last request that touched it, regardless of whether the client is idle, running
  * a long tool, or blocked waiting for a human answer.
  */
-function cacheCountdown(sinceMs: number, now: number): { text: string; level: CacheLevel } {
+export function cacheCountdown(sinceMs: number, now: number): { text: string; level: CacheLevel } {
   const elapsed = Math.max(0, now - sinceMs);
   const dur = formatDuration(elapsed);
   if (elapsed >= CACHE_TTL_MS) {
@@ -119,7 +119,7 @@ function cacheCountdown(sinceMs: number, now: number): { text: string; level: Ca
   return { text: `⌛ ${dur}`, level: "dim" };
 }
 
-function truncatePrompt(text: string): string {
+export function truncatePrompt(text: string): string {
   const first = text.split("\n")[0] ?? text;
   return first.length <= PROMPT_PREVIEW ? first : first.slice(0, PROMPT_PREVIEW - 1) + "…";
 }
@@ -133,7 +133,7 @@ function truncatePrompt(text: string): string {
  * message (the agent's final activity). durationMs is that span; waitBeforeMs
  * is the idle gap between the previous turn's settle and this user message.
  */
-function reconstructHistory(entries: readonly unknown[]): TurnRecord[] {
+export function reconstructHistory(entries: readonly unknown[]): TurnRecord[] {
   type MsgEntry = { type: string; timestamp?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
   const msgs = (entries as MsgEntry[]).filter(
     (e) => e.type === "message" && e.message != null && typeof e.timestamp === "string",
@@ -406,14 +406,19 @@ class TimerHistoryComponent {
 // File writing
 // ---------------------------------------------------------------------------
 
-function buildDefaultPath(sessionName: string | undefined): string {
+export function buildDefaultPath(sessionName: string | undefined): string {
   const now = new Date();
   const date = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
   const time = `${pad2(now.getHours())}-${pad2(now.getMinutes())}`;
-  const slug =
-    sessionName != null && sessionName.length > 0
-      ? `-${sessionName.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 40)}`
+  const core =
+    sessionName != null
+      ? sessionName
+          .replace(/[^a-z0-9]+/gi, "-")
+          .toLowerCase()
+          .slice(0, 40)
+          .replace(/^-+|-+$/g, "")
       : "";
+  const slug = core.length > 0 ? `-${core}` : "";
   // Return a cwd-relative path so it fits in the overlay without truncation.
   return nodePath.join(".scratch", `timer-${date}-${time}${slug}.md`);
 }
