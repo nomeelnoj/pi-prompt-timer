@@ -101,7 +101,9 @@ From the overlay, `→` or `w` opens a titled "Write to file" panel:
 
 - **Auto path** — `.scratch/timer-<date>[-session].md`, relative to the current working directory; press `enter` to
   write immediately.
-- **Choose your own location** — opens an input pre-filled with the auto path so you can edit the destination.
+- **Choose a relative path** — opens an input pre-filled with the auto path. The destination must be **relative to the
+  project directory**; absolute paths and `../` escapes are rejected. The save confirmation shows the full resolved
+  path so the destination is unambiguous.
 
 The file records each turn's timestamp, response duration, and prompt preview, with `waiting` markers for idle gaps. The
 `.scratch/` directory is created automatically if it does not exist.

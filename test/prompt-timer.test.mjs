@@ -8,7 +8,7 @@ import { createJiti } from "jiti";
 // directly here.
 const jiti = createJiti(import.meta.url, { moduleCache: false });
 const extensionPath = fileURLToPath(new URL("../extensions/prompt-timer/index.ts", import.meta.url));
-const { formatDuration, cacheCountdown, truncatePrompt, buildDefaultPath, reconstructHistory } =
+const { formatDuration, cacheCountdown, truncatePrompt, buildDefaultPath, reconstructHistory, stripControlChars, resolveWithinCwd } =
   await jiti.import(extensionPath);
 
 test("formatDuration renders seconds, m:ss, and h:mm:ss", () => {
@@ -81,4 +81,23 @@ test("reconstructHistory ignores non-message and empty entries", () => {
     reconstructHistory([{ type: "custom", customType: "whatever", data: {} }]),
     [],
   );
+});
+
+test("stripControlChars removes escape/control bytes", () => {
+  assert.equal(stripControlChars("hello"), "hello");
+  assert.equal(stripControlChars("a\x1b]0;evilb"), "a]0;evilb");
+  assert.equal(stripControlChars("tab\tbell\x07nul\x00"), "tabbellnul");
+});
+
+test("resolveWithinCwd confines custom paths to cwd", () => {
+  const cwd = "/home/user/project";
+  // valid relative paths resolve to an absolute inside cwd
+  assert.equal(resolveWithinCwd(cwd, ".scratch/timer.md"), "/home/user/project/.scratch/timer.md");
+  assert.equal(resolveWithinCwd(cwd, "notes/a.md"), "/home/user/project/notes/a.md");
+  // rejected: absolute, traversal escape, empty, and cwd itself
+  assert.equal(resolveWithinCwd(cwd, "/etc/passwd"), null);
+  assert.equal(resolveWithinCwd(cwd, "../outside.md"), null);
+  assert.equal(resolveWithinCwd(cwd, "../../etc/passwd"), null);
+  assert.equal(resolveWithinCwd(cwd, ""), null);
+  assert.equal(resolveWithinCwd(cwd, "."), null);
 });

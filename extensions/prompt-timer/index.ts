@@ -125,6 +125,29 @@ export function truncatePrompt(text: string): string {
 }
 
 /**
+ * Strip C0/C1 control characters so interpolated values (session name, cwd)
+ * cannot inject terminal escape sequences when written to the title bar.
+ */
+export function stripControlChars(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+}
+
+/**
+ * Resolve a user-supplied history path against cwd, returning the absolute
+ * path only if it stays strictly inside cwd. Absolute paths, `..` escapes, and
+ * the cwd itself are rejected (returns null). Keeps the custom save path
+ * confined to the project directory.
+ */
+export function resolveWithinCwd(cwd: string, rel: string): string | null {
+  if (!rel || nodePath.isAbsolute(rel)) return null;
+  const root = nodePath.resolve(cwd);
+  const resolved = nodePath.resolve(root, rel);
+  if (resolved === root) return null; // must name a file, not the directory
+  return resolved.startsWith(root + nodePath.sep) ? resolved : null;
+}
+
+/**
  * Reconstruct turn history from the session transcript. This is the source of
  * truth: real user/assistant messages always persist in the session file, so
  * history survives /reload and is recovered for pre-existing sessions.
@@ -316,7 +339,7 @@ class TimerHistoryComponent {
       lines.push(border("│") + fillToWidth(autoPrefix + autoText, innerWidth) + border("│"));
 
       // Option 1 — custom location
-      const customLabel  = "Choose your own location…";
+      const customLabel  = "Choose a relative path…";
       const customPrefix = this.writeSelected === 1 ? t.fg("accent", "  ❯ ") : "    ";
       const customText   = this.writeSelected === 1 ? t.fg("accent", customLabel) : t.fg("dim", customLabel);
       lines.push(border("│") + fillToWidth(customPrefix + customText, innerWidth) + border("│"));
@@ -429,8 +452,9 @@ async function writeHistoryFile(
   history: TurnRecord[],
   sessionName: string | undefined,
 ): Promise<void> {
-  // Resolve relative paths against cwd so .scratch/ lands in the project dir.
-  const resolved = nodePath.isAbsolute(filePath) ? filePath : nodePath.join(cwd, filePath);
+  // filePath is always cwd-relative (auto path or a caller-validated custom
+  // path), so resolve it against cwd; the project dir contains the output.
+  const resolved = nodePath.resolve(cwd, filePath);
   const now = new Date();
   const lines: string[] = [
     "# Timer History",
@@ -482,9 +506,10 @@ export default function promptTimer(pi: ExtensionAPI) {
   // ── Title-bar helpers ───────────────────────────────────────────────────────
 
   function baseTitle(): string {
-    const cwd = nodePath.basename(process.cwd());
+    const cwd = stripControlChars(nodePath.basename(process.cwd()));
     const name = pi.getSessionName();
-    return name ? `π - ${name} - ${cwd}` : `π - ${cwd}`;
+    const safeName = name ? stripControlChars(name) : "";
+    return safeName ? `π - ${safeName} - ${cwd}` : `π - ${cwd}`;
   }
 
   /** Paint the cache-TTL countdown into the title while a prompt is open. */
@@ -555,16 +580,29 @@ export default function promptTimer(pi: ExtensionAPI) {
     if (result === "write-auto") {
       try {
         await writeHistoryFile(autoPath, ctx.cwd, history, sessionName ?? undefined);
-        ctx.ui.notify(`Saved → ${autoPath}`, "info");
+        ctx.ui.notify(`Saved → ${nodePath.resolve(ctx.cwd, autoPath)}`, "info");
       } catch (err) {
         ctx.ui.notify(`Write failed: ${(err as Error).message}`, "error");
       }
     } else if (result === "write-custom") {
-      const filePath = await ctx.ui.input("Write timer history to file", autoPath);
-      if (!filePath?.trim()) return;
+      const input = await ctx.ui.input(
+        "Save timer history — path relative to the project directory",
+        autoPath,
+      );
+      const rel = input?.trim();
+      if (!rel) return;
+      // Confine the custom path to inside cwd: no absolute paths, no `..` escapes.
+      const resolved = resolveWithinCwd(ctx.cwd, rel);
+      if (!resolved) {
+        ctx.ui.notify(
+          "Path must be relative to the project directory (no absolute or ../ paths).",
+          "error",
+        );
+        return;
+      }
       try {
-        await writeHistoryFile(filePath.trim(), ctx.cwd, history, sessionName ?? undefined);
-        ctx.ui.notify(`Saved → ${filePath.trim()}`, "info");
+        await writeHistoryFile(rel, ctx.cwd, history, sessionName ?? undefined);
+        ctx.ui.notify(`Saved → ${resolved}`, "info");
       } catch (err) {
         ctx.ui.notify(`Write failed: ${(err as Error).message}`, "error");
       }

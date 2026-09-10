@@ -19,8 +19,11 @@ The extension surfaces information in three local places:
 
 - The Pi footer, which shows the live timer and prompt-cache-TTL countdown.
 - The terminal title bar, which mirrors the cache-TTL countdown while a blocking prompt or overlay covers the footer.
-- A Markdown history file, written only on an explicit "Write to file" action to a path you confirm (default
-  `.scratch/timer-<date>[-session].md`, relative to the current working directory).
+  Interpolated values (session name, working-directory name) are stripped of control characters before being written,
+  so they cannot inject terminal escape sequences.
+- A Markdown history file, written only on an explicit "Write to file" action. The path is confined to the project
+  directory: the auto path is `.scratch/timer-<date>[-session].md`, and a custom path must be relative to the working
+  directory (absolute paths and `../` escapes are rejected).
 
 The written history file contains per-turn timestamps, durations, and short prompt previews (the first line of each
 prompt, truncated). If you write it to a shared or committed location, be aware it can contain those prompt snippets.
