@@ -214,13 +214,13 @@ function fillToWidth(s: string, w: number): string {
 // TimerHistoryComponent
 // ---------------------------------------------------------------------------
 
-class TimerHistoryComponent {
+export class TimerHistoryComponent {
   private selected = 0;
   private readonly rows: DisplayRow[];
   private liveTimer: ReturnType<typeof setInterval> | null = null;
-  /** Whether the write-panel is open at the top of the overlay. */
-  private writeMode = false;
-  /** 0 = auto path, 1 = choose own location */
+  /** Active tab: 0 = History, 1 = Write to file. */
+  private tab: 0 | 1 = 0;
+  /** Write-to-file option: 0 = auto path, 1 = choose a relative path. */
   private writeSelected: 0 | 1 = 0;
 
   constructor(
@@ -260,6 +260,31 @@ class TimerHistoryComponent {
       this.liveTimer = null;
     }
     this.doneFn(result);
+  }
+
+  /** Draw the top tab strip (History │ Write to file); active tab highlighted. */
+  private renderTabStrip(innerWidth: number): string {
+    const t = this.theme;
+    const labels = ["History", "Write to file"];
+    let out = "";
+    let vis = 0;
+    for (let i = 0; i < labels.length; i++) {
+      if (i > 0) {
+        out += t.fg("border", "│");
+        vis += 1;
+      }
+      const cell = ` ${labels[i]} `;
+      out += i === this.tab ? t.fg("accent", cell) : t.fg("dim", cell);
+      vis += visibleWidth(cell);
+    }
+    return out + " ".repeat(Math.max(0, innerWidth - vis));
+  }
+
+  private setTab(tab: 0 | 1): void {
+    if (this.tab === tab) return;
+    this.tab = tab;
+    if (tab === 1) this.writeSelected = 0;
+    this.tui.requestRender(true); // structural change → full repaint
   }
 
   private renderRow(row: DisplayRow, selected: boolean, innerWidth: number): string {
@@ -303,88 +328,79 @@ class TimerHistoryComponent {
     const innerWidth = width - 2;
     const border = (s: string) => this.theme.fg("border", s);
     const t = this.theme;
+    const CONTENT_ROWS = 12; // fixed content height so the box never jumps
 
-    // Fixed content budget: spacer(1) + list rows, or write-panel(4) + list rows.
-    // Keep total box height constant so it never jumps between modes.
-    const CONTENT_ROWS = 15; // spacer + up-to-14 list rows
-    const writePanelRows = 4; // title + opt0 + opt1 + separator
-    const maxListRows = this.writeMode
-      ? Math.min(Math.max(this.rows.length, 1), CONTENT_ROWS - writePanelRows)
-      : Math.min(Math.max(this.rows.length, 1), CONTENT_ROWS - 1);
-
-    if (this.rows.length > 0) {
-      this.selected = Math.max(0, Math.min(this.selected, this.rows.length - 1));
-    }
-
-    const scrollStart = Math.max(0, this.selected - maxListRows + 1);
-    const visibleRows  = this.rows.slice(scrollStart, scrollStart + maxListRows);
     const lines: string[] = [];
+    // ── Box top + tab strip header (History │ Write to file) ────────────────
+    lines.push(border("┌") + border("─".repeat(innerWidth)) + border("┐"));
+    lines.push(border("│") + this.renderTabStrip(innerWidth) + border("│"));
+    lines.push(border("├") + border("─".repeat(innerWidth)) + border("┤"));
 
-    // ── Outer title (always the same) ──────────────────────────────────────
-    const outerTitle = "  ⏱  Timer History  ";
-    const outerFill  = "─".repeat(Math.max(0, innerWidth - visibleWidth(outerTitle)));
-    lines.push(border("┌") + t.fg("accent", outerTitle) + border(outerFill) + border("┐"));
-
-    // ── Write panel (immediately below outer title when active) ──────────
-    if (this.writeMode) {
-      // Titled section header using ├/┤ T-junctions
-      const panelTitle = " Write to file ";
-      const panelFill  = border("─".repeat(Math.max(0, innerWidth - visibleWidth(panelTitle))));
-      lines.push(border("├") + t.fg("accent", panelTitle) + panelFill + border("┤"));
-
-      // Option 0 — auto path
-      const autoLabel  = truncateToWidth(this.autoPath, innerWidth - 4);
-      const autoPrefix = this.writeSelected === 0 ? t.fg("accent", "  ❯ ") : "    ";
-      const autoText   = this.writeSelected === 0 ? t.fg("accent", autoLabel) : t.fg("dim", autoLabel);
-      lines.push(border("│") + fillToWidth(autoPrefix + autoText, innerWidth) + border("│"));
-
-      // Option 1 — custom location
-      const customLabel  = "Choose a relative path…";
-      const customPrefix = this.writeSelected === 1 ? t.fg("accent", "  ❯ ") : "    ";
-      const customText   = this.writeSelected === 1 ? t.fg("accent", customLabel) : t.fg("dim", customLabel);
-      lines.push(border("│") + fillToWidth(customPrefix + customText, innerWidth) + border("│"));
-
-      // Closing separator using ├/┤ so history below is visually separated
-      lines.push(border("├") + border("─".repeat(innerWidth)) + border("┤"));
-    } else {
-      // Blank spacer (normal mode)
-      lines.push(border("│") + " ".repeat(innerWidth) + border("│"));
-    }
-
-    // ── History rows ──────────────────────────────────────────────────
-    if (this.rows.length === 0) {
-      lines.push(border("│") + fillToWidth(t.fg("dim", "   (no history yet)"), innerWidth) + border("│"));
-    } else {
-      for (let i = 0; i < visibleRows.length; i++) {
-        const globalIdx = scrollStart + i;
-        const isActive  = !this.writeMode && globalIdx === this.selected;
-        const content   = this.renderRow(visibleRows[i]!, isActive, innerWidth);
-        const row = this.writeMode
-          ? border("│") + fillToWidth(t.fg("dim", content), innerWidth) + border("│")
-          : border("│") + fillToWidth(content, innerWidth) + border("│");
-        lines.push(row);
+    // ── Tab body ────────────────────────────────────────────────────────────
+    const content: string[] = [];
+    if (this.tab === 0) {
+      if (this.rows.length === 0) {
+        content.push(fillToWidth(t.fg("dim", "   (no history yet)"), innerWidth));
+      } else {
+        this.selected = Math.max(0, Math.min(this.selected, this.rows.length - 1));
+        const scrollStart = Math.max(0, this.selected - CONTENT_ROWS + 1);
+        const visible = this.rows.slice(scrollStart, scrollStart + CONTENT_ROWS);
+        for (let i = 0; i < visible.length; i++) {
+          const isActive = scrollStart + i === this.selected;
+          content.push(fillToWidth(this.renderRow(visible[i]!, isActive, innerWidth), innerWidth));
+        }
       }
+    } else {
+      content.push(fillToWidth(t.fg("dim", "   Save the timer history as a Markdown file:"), innerWidth));
+      content.push(" ".repeat(innerWidth));
+      const optionRow = (idx: 0 | 1, label: string): string => {
+        const active = this.writeSelected === idx;
+        const prefix = active ? t.fg("accent", "  ❯ ") : "    ";
+        return prefix + (active ? t.fg("accent", label) : t.fg("dim", label));
+      };
+      content.push(fillToWidth(optionRow(0, truncateToWidth(this.autoPath, innerWidth - 6)), innerWidth));
+      content.push(fillToWidth(optionRow(1, "Choose a relative path…"), innerWidth));
     }
 
-    // ── Pad to constant height ───────────────────────────────────────
-    const targetContentLines = 1 + CONTENT_ROWS; // outer title + content budget
-    while (lines.length < targetContentLines) {
-      lines.push(border("│") + " ".repeat(innerWidth) + border("│"));
+    while (content.length < CONTENT_ROWS) content.push(" ".repeat(innerWidth));
+    for (const c of content.slice(0, CONTENT_ROWS)) {
+      lines.push(border("│") + c + border("│"));
     }
     lines.push(border("└") + border("─".repeat(innerWidth)) + border("┘"));
 
-    // ── Hint ─────────────────────────────────────────────────────────
-    const scrollNote = this.rows.length > maxListRows ? " • ↑↓ scroll" : "";
-    const hint = this.writeMode
-      ? "  ↑↓  navigate  ·  enter  confirm  ·  esc  dismiss  "
-      : `  ↑↓ / j k  navigate${scrollNote}  ·  → / w  write to file  ·  esc / q  close  `;
+    // ── Hint line (below the box) ────────────────────────────────────────────
+    const hint = this.tab === 0
+      ? "  ↑↓ / j k  navigate  ·  → / tab  write to file  ·  esc / q  close  "
+      : "  ↑↓  select  ·  enter  save  ·  ← / tab  history  ·  esc  close  ";
     lines.push(t.fg("dim", truncateToWidth(hint, width)));
     return lines;
   }
 
   handleInput(data: string): void {
-    if (this.writeMode) {
-      // ── Write panel navigation ───────────────────────────────────────
+    if (matchesKey(data, Key.escape) || data === "q" || matchesKey(data, Key.ctrl("c"))) {
+      this.done("close");
+      return;
+    }
+    // Tab strip navigation
+    if (matchesKey(data, Key.left)) {
+      this.setTab(0);
+      return;
+    }
+    if (matchesKey(data, Key.right)) {
+      this.setTab(1);
+      return;
+    }
+    if (matchesKey(data, Key.tab) || matchesKey(data, "shift+tab")) {
+      this.setTab(this.tab === 0 ? 1 : 0);
+      return;
+    }
+    if (data === "w") {
+      this.setTab(1);
+      return;
+    }
+
+    if (this.tab === 1) {
+      // Write-to-file options
       if (matchesKey(data, Key.up)) {
         this.writeSelected = 0;
         this.tui.requestRender();
@@ -393,15 +409,11 @@ class TimerHistoryComponent {
         this.tui.requestRender();
       } else if (matchesKey(data, Key.enter)) {
         this.done(this.writeSelected === 0 ? "write-auto" : "write-custom");
-      } else if (matchesKey(data, Key.escape)) {
-        // Dismiss write panel — full repaint to restore history layout
-        this.writeMode = false;
-        this.tui.requestRender(true);
       }
       return;
     }
 
-    // ── History navigation ─────────────────────────────────────────────
+    // History list
     const count = Math.max(this.rows.length, 1);
     if (matchesKey(data, Key.up) || data === "k") {
       this.selected = Math.max(0, this.selected - 1);
@@ -409,16 +421,8 @@ class TimerHistoryComponent {
     } else if (matchesKey(data, Key.down) || data === "j") {
       this.selected = Math.min(count - 1, this.selected + 1);
       this.tui.requestRender();
-    } else if (matchesKey(data, Key.right) || data === "w" || data === "\x1b[C") {
-      // Open write panel — force full repaint so structural layout change is fully flushed
-      this.writeMode = true;
-      this.writeSelected = 0;
-      this.tui.requestRender(true);
-    } else if (matchesKey(data, Key.escape) || data === "q" || matchesKey(data, Key.ctrl("c"))) {
-      this.done("close");
     }
   }
-
   invalidate(): void {
     // Force a full repaint on theme changes so structural layout is always consistent
     this.tui.requestRender(true);
@@ -573,7 +577,7 @@ export default function promptTimer(pi: ExtensionAPI) {
         new TimerHistoryComponent(history, liveEntry, autoPath, tui, theme, done),
       {
         overlay: true,
-        overlayOptions: { maxHeight: "90%", minWidth: 60, anchor: "top-center" },
+        overlayOptions: { width: "72%", minWidth: 54, maxHeight: "80%", anchor: "center" },
       },
     );
 

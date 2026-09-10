@@ -85,19 +85,20 @@ Open the per-turn history with the command or shortcut:
 ctrl+alt+t
 ```
 
-The overlay lists one row per turn — the agent's response time and a preview of your prompt — with idle gaps longer than
-30 seconds shown as `waiting` rows (red once they exceed the 5-minute cache TTL). An in-progress turn appears as a live
-row at the bottom.
+The overlay is a centered floating modal with a header strip of two tabs — **History** and **Write to file** — modeled
+on pi-copy-code's response tabs. The **History** tab lists one row per turn (the agent's response time and a preview of
+your prompt), with idle gaps longer than 30 seconds shown as `waiting` rows (red once they exceed the 5-minute cache
+TTL). An in-progress turn appears as a live row at the bottom.
 
 When the overlay is open:
 
 - `↑` / `↓` or `j` / `k` — move through history
-- `→` or `w` — open the "Write to file" panel
+- `→` / `tab` — switch to the **Write to file** tab (`←` / `tab` switches back)
 - `esc` or `q` — close
 
 ### Write history to a file
 
-From the overlay, `→` or `w` opens a titled "Write to file" panel:
+Switch to the **Write to file** tab (`→` or `tab`) and pick an option with `↑` / `↓`, then `enter`:
 
 - **Auto path** — `.scratch/timer-<date>[-session].md`, relative to the current working directory; press `enter` to
   write immediately.
