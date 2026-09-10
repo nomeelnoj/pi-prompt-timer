@@ -51,8 +51,10 @@ pi -e "$(pwd)"
 
 Before step 4, you can dry-run the publish workflow via `workflow_dispatch` with the expected tag.
 
-The `release` environment must have `NPM_TOKEN` set as a secret (a granular npm access token with
-publish permission for this package).
+Publishing uses npm trusted publishing (OIDC) — there is no `NPM_TOKEN` secret. The `publish` job
+authenticates through GitHub OIDC (`id-token: write`) against a trusted publisher configured on npm for
+this repo, the `publish.yml` workflow, and the `release` environment, and provenance is automatic. See
+`CONTRIBUTING.md` for the one-time trusted-publisher setup (including the first `0.1.0` publish).
 
 ## Repository hygiene
 
