@@ -8,12 +8,18 @@ All notable changes are documented here. The format follows
 ### Added
 
 - Initial release.
-- Thinking timer widget above the editor: shows elapsed time while the agent is working, with
-  start timestamp. Dismissed automatically on `agent_settled`.
-- Idle timer in footer: counts up since the last agent response, dim below 4 minutes, warning
-  at 4 minutes, error/red at 5 minutes (Anthropic prompt-cache TTL). Includes remaining-time
-  countdown in the warning band and explicit "cache expired" label once TTL passes.
-- Transcript timestamps: a small `↑`/`↓` stamp appended after each user prompt and agent
-  response, showing wall-clock time and run duration. TUI-only; never enters LLM context.
-- Single 1-second tick loop drives all live surfaces; started on `session_start` and stopped
-  cleanly on `session_shutdown`.
+- **Footer timer** (always visible, ticks every second): shows elapsed thinking time while the agent
+  works, then a prompt-cache-TTL countdown while idle — dim below 4 minutes, amber at 4, red at 5 —
+  with the last run's duration. The idle clock is anchored to the last completed provider response,
+  so it counts correctly during idle time, long tool runs, and blocking-prompt waits alike.
+- **`/timer` command and `ctrl+alt+t` shortcut**: open a history overlay listing each turn's response
+  time and prompt preview, with idle gaps over 30 seconds shown as "waiting" rows (red past the cache
+  TTL) and a live row for any in-progress turn.
+- **Write to file**: from the overlay, `→` / `w` opens a titled panel offering an auto path
+  (`.scratch/timer-<date>[-session].md`, cwd-relative) or a custom location, writing timestamps,
+  durations, and prompt previews to Markdown.
+- **Title-bar mirror**: while a blocking prompt/overlay covers the footer (for example an
+  `ask_user_question` questionnaire), the cache-TTL countdown is mirrored into the terminal title bar.
+  Gated by `MIRROR_TO_TITLE_DURING_PROMPTS`.
+- History is reconstructed from the in-memory session transcript on demand, so it survives `/reload`
+  with no parallel log and no per-turn disk writes; only `/new` starts empty.
