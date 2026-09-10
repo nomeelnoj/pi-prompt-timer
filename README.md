@@ -122,8 +122,12 @@ default TTL is 5 minutes (`CACHE_TTL_MS`); adjust the constant if your provider 
 
 ## Support and contributing
 
-- Use the [bug report form](https://github.com/nomeelnoj/pi-prompt-timer/issues/new?template=bug_report.md) for
-  reproducible problems.
+- Use the [bug report form](https://github.com/nomeelnoj/pi-prompt-timer/issues/new?template=bug_report.yml) for
+  reproducible problems, or the
+  [feature request form](https://github.com/nomeelnoj/pi-prompt-timer/issues/new?template=feature_request.yml) for
+  focused proposals.
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
 - See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Package shape

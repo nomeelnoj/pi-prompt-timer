@@ -1,0 +1,83 @@
+name: Bug report
+description: Report reproducible incorrect behavior in @nomeelnoj/pi-prompt-timer
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not report vulnerabilities here. Use the private GitHub Security Advisory link in SECURITY.md.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the exact command, shortcut, or sequence of turns.
+      placeholder: |
+        1. Start Pi with ...
+        2. Send this prompt ...
+        3. Open /timer or wait ...
+        4. Observe ...
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface is affected?
+      options:
+        - Footer timer (thinking / idle cache countdown)
+        - /timer history overlay
+        - Write to file
+        - Title-bar mirror during prompts
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      placeholder: e.g. WezTerm 20240203, Terminal.app 2.14, Ghostty
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. macOS 15.5, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: pi-version
+    attributes:
+      label: Pi version
+      placeholder: e.g. 0.84.4
+    validations:
+      required: true
+  - type: input
+    id: package-version
+    attributes:
+      label: "@nomeelnoj/pi-prompt-timer version"
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Additional output
+      description: Paste relevant errors or screenshots. Remove sensitive prompt text and environment details.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I can reproduce this with the package version listed above.
+          required: true
+        - label: This report does not contain a vulnerability or sensitive prompt text.
+          required: true
