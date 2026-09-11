@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+
+.scratch/
+.pi/
+.pi-subagents/
+.impeccable/
+.aider*
+.continue/
+.repomap/
+CLAUDE.local.md
+*.tgz
+.claude/*
+!.claude/CLAUDE.md

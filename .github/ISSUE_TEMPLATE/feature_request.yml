@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a focused improvement to @nomeelnoj/pi-prompt-timer
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for proposing an improvement. Explain the concrete timing workflow it would improve.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem or limitation do you encounter?
+      placeholder: Describe the workflow and why current behavior is insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should the extension do instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface does this concern?
+      options:
+        - Footer timer (thinking / idle cache countdown)
+        - /timer history overlay
+        - Write to file
+        - Title-bar mirror during prompts
+        - Not surface-specific
+    validations:
+      required: true
+  - type: input
+    id: pi-version
+    attributes:
+      label: Pi version
+      placeholder: e.g. 0.84.4
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: How do you handle this workflow today?
