@@ -13,9 +13,12 @@ const {
   formatDurationCoarse,
   cacheLevel,
   cacheCountdown,
+  estimateCacheMissCost,
+  formatEstimatedCost,
   truncatePrompt,
   buildDefaultPath,
   reconstructHistory,
+  findLastAssistantUsage,
   stripControlChars,
   resolveWithinCwd,
   renderHistoryMarkdown,
@@ -69,6 +72,53 @@ test("formatDurationCoarse drops seconds past a minute and minutes past an hour"
   assert.equal(formatDurationCoarse(58 * 60_000 + 40_000), "58m");
   assert.equal(formatDurationCoarse(60 * 60_000), "1h");
   assert.equal(formatDurationCoarse(65 * 60_000), "1h 5m");
+});
+
+test("estimateCacheMissCost uses the cache-write rate when the provider charges one", () => {
+  // Anthropic-style: cacheRead cheap, cacheWrite pricier than plain input.
+  const rates = { input: 3, cacheRead: 0.3, cacheWrite: 3.75 }; // $/1M tokens
+  const cost = estimateCacheMissCost(100_000, rates);
+  assert.ok(cost !== null);
+  // (3.75 - 0.3) * 100_000 / 1_000_000 = 0.345
+  assert.ok(Math.abs(cost - 0.345) < 1e-9, `expected ~0.345, got ${cost}`);
+});
+
+test("estimateCacheMissCost falls back to the input rate when there is no cache-write rate", () => {
+  // OpenAI/Gemini-style implicit caching: no separate write fee, a miss just
+  // means those tokens become plain input tokens again.
+  const rates = { input: 2, cacheRead: 0.5, cacheWrite: 0 };
+  const cost = estimateCacheMissCost(200_000, rates);
+  assert.ok(cost !== null);
+  // (2 - 0.5) * 200_000 / 1_000_000 = 0.3
+  assert.ok(Math.abs(cost - 0.3) < 1e-9, `expected ~0.3, got ${cost}`);
+});
+
+test("estimateCacheMissCost returns null when there is nothing to estimate", () => {
+  assert.equal(estimateCacheMissCost(0, { input: 3, cacheRead: 0.3, cacheWrite: 3.75 }), null);
+  assert.equal(estimateCacheMissCost(100_000, null), null);
+  assert.equal(estimateCacheMissCost(100_000, { input: 0, cacheRead: 0, cacheWrite: 0 }), null);
+  // cacheRead >= the miss rate (unusual, but should never report a negative cost)
+  assert.equal(estimateCacheMissCost(100_000, { input: 1, cacheRead: 5, cacheWrite: 0 }), null);
+});
+
+test("formatEstimatedCost floors tiny amounts and rounds to cents otherwise", () => {
+  assert.equal(formatEstimatedCost(0.004), "<$0.01");
+  assert.equal(formatEstimatedCost(0.01), "$0.01");
+  assert.equal(formatEstimatedCost(1.014), "$1.01");
+});
+
+test("findLastAssistantUsage returns the most recent assistant message's cache usage", () => {
+  const entry = (role, usage) => ({ type: "message", message: { role, usage } });
+  assert.equal(findLastAssistantUsage([]), null);
+  assert.equal(findLastAssistantUsage([entry("user", undefined)]), null);
+
+  const entries = [
+    entry("user", undefined),
+    entry("assistant", { cacheRead: 1_000, cacheWrite: 200 }),
+    entry("user", undefined),
+    entry("assistant", { cacheRead: 5_000, cacheWrite: 0 }),
+  ];
+  assert.deepEqual(findLastAssistantUsage(entries), { cacheRead: 5_000, cacheWrite: 0 });
 });
 
 test("truncatePrompt keeps the first line and bounds the length", () => {

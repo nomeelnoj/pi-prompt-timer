@@ -65,11 +65,16 @@ The footer updates every second and reflects one of three states:
   |---------|-------|---------|
   | < 4 min | dim | `⌛ 2:45  @14:33:28   last: 1:23` |
   | 4–5 min | amber | `⌛ 4:12  · cache TTL expires in 0:48` |
-  | ≥ 5 min | red | `⚠ cache TTL expired · idle 12m  @14:33:28` |
+  | ≥ 5 min | red | `⚠ cache TTL expired · idle 12m  · ~$0.08 to rebuild  @14:33:28` |
 
   Once the cache has expired, the countdown switches from second-precision elapsed time to a coarse
   "idle for" duration (seconds, then whole minutes, then hours+minutes) so the number does not keep growing
   with jittery precision the longer you stay away.
+
+  The `~$0.08 to rebuild` figure is a labeled **estimate**, not a metered cost: it multiplies the tokens read from
+  cache on the last response by the gap between the model's cache-write and cache-read rates (falling back to the
+  plain input rate for providers that don't charge a separate cache-write fee). It only appears once the model reports
+  pricing — local or unknown models show nothing rather than a misleading `$0.00`.
 
 - **Fresh session** — a single `—` until the first turn completes.
 

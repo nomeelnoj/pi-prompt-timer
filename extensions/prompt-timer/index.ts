@@ -5,7 +5,9 @@
  *   Footer (always visible, live-ticking every second)
  *     • Thinking  →  ⏱  1:23  started 14:32:05
  *     • Idle      →  ⌛ 4:32  · cache TTL expires in 0:28  @14:33:28  last: 15s
- *     • Idle ≥5m  →  red  ⚠ cache TTL expired · idle 12m  @14:33:28
+ *     • Idle ≥5m  →  red  ⚠ cache TTL expired · idle 12m  · ~$0.08 to rebuild  @14:33:28
+ *       (the "to rebuild" estimate only appears once the model reports cache
+ *       pricing; it is a labeled approximation, not a metered bill)
  *
  *   Title bar (only while a blocking prompt/overlay is open)
  *     The footer is occluded by prompt overlays (e.g. ask_user_question), so the
@@ -163,6 +165,39 @@ export function cacheCountdown(sinceMs: number, now: number): { text: string; le
   return { text: `⌛ ${dur}`, level };
 }
 
+/** Per-million-token pricing pulled from `ctx.model.cost` at the time a cache was written. */
+export type CacheCostRates = { input: number; cacheRead: number; cacheWrite: number };
+
+/**
+ * Estimated USD cost of letting a warm cache of `cachedTokens` expire, i.e.
+ * what the next read of that context will cost instead of a cheap cache hit.
+ *
+ * Providers that charge a distinct cache-write rate (Anthropic-style explicit
+ * caching) pay that rate to re-establish the cache. Providers that report no
+ * cache-write rate (OpenAI/Gemini-style implicit caching) fall back to the
+ * plain input rate, since those tokens simply become ordinary input tokens
+ * again on a miss. This is always an approximation — the real bill also
+ * depends on how much new content accumulated in the meantime — so callers
+ * should present it as a labeled estimate, not a precise cost.
+ *
+ * Returns null when there is nothing to estimate: no cached tokens, or the
+ * model reports no pricing at all (for example local/unknown models with
+ * all-zero rates).
+ */
+export function estimateCacheMissCost(cachedTokens: number, rates: CacheCostRates | null): number | null {
+  if (!rates || cachedTokens <= 0) return null;
+  if (rates.input === 0 && rates.cacheRead === 0 && rates.cacheWrite === 0) return null; // no known pricing
+  const missRate = rates.cacheWrite > 0 ? rates.cacheWrite : rates.input;
+  const perTokenDelta = Math.max(0, missRate - rates.cacheRead);
+  const cost = (cachedTokens * perTokenDelta) / 1_000_000;
+  return cost > 0 ? cost : null;
+}
+
+/** Render a USD estimate compactly, flooring tiny amounts to a legible "<$0.01". */
+export function formatEstimatedCost(usd: number): string {
+  return usd < 0.01 ? "<$0.01" : `$${usd.toFixed(2)}`;
+}
+
 export function truncatePrompt(text: string): string {
   const first = text.split("\n")[0] ?? text;
   return first.length <= PROMPT_PREVIEW ? first : first.slice(0, PROMPT_PREVIEW - 1) + "…";
@@ -252,6 +287,23 @@ export function reconstructHistory(entries: readonly unknown[]): TurnRecord[] {
 function fillToWidth(s: string, w: number): string {
   const truncated = truncateToWidth(s, w);
   return truncated + " ".repeat(Math.max(0, w - visibleWidth(truncated)));
+}
+
+/**
+ * Find the most recent assistant message's cache usage in the raw session
+ * transcript. Used to restore the cache-miss-cost estimate on /reload,
+ * mirroring how lastProviderResponseAt/lastRunMs are restored from history.
+ */
+export function findLastAssistantUsage(entries: readonly unknown[]): { cacheRead: number; cacheWrite: number } | null {
+  type UsageEntry = { type: string; message?: { role?: string; usage?: { cacheRead?: number; cacheWrite?: number } } };
+  const msgs = entries as UsageEntry[];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m?.type === "message" && m.message?.role === "assistant" && m.message.usage) {
+      return { cacheRead: m.message.usage.cacheRead ?? 0, cacheWrite: m.message.usage.cacheWrite ?? 0 };
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +691,10 @@ export default function promptTimer(pi: ExtensionAPI) {
   // completed (last assistant message end). Ticks down during idle, long tool
   // runs, and human-input waits (ask_user_question) alike.
   let lastProviderResponseAt: number | null = null;
+  // Cache usage/pricing snapshot from that same last provider response, used
+  // to estimate the cost of a cache miss once the TTL has expired.
+  let lastCachedTokens = 0;
+  let lastCacheCostRates: CacheCostRates | null = null;
   let pendingPromptText = "";
   let pendingInputAt: number | null = null;
   // True while a blocking user-facing prompt/overlay is open.
@@ -789,10 +845,14 @@ export default function promptTimer(pi: ExtensionAPI) {
 
   // Last provider round-trip completed — the moment the cache was (re)written.
   // Fires before tool execution, so an ask_user_question wait is anchored here.
-  pi.on("message_end", async (event) => {
-    if (event.message.role === "assistant") {
-      lastProviderResponseAt = Date.now();
-    }
+  pi.on("message_end", async (event, ctx) => {
+    if (event.message.role !== "assistant") return;
+    lastProviderResponseAt = Date.now();
+    const usage = event.message.usage;
+    lastCachedTokens = (usage?.cacheRead ?? 0) + (usage?.cacheWrite ?? 0);
+    lastCacheCostRates = ctx.model?.cost
+      ? { input: ctx.model.cost.input, cacheRead: ctx.model.cost.cacheRead, cacheWrite: ctx.model.cost.cacheWrite }
+      : null;
   });
 
   // Blocking user-facing prompt opened/closed (ask_user_question, confirm,
@@ -829,6 +889,8 @@ export default function promptTimer(pi: ExtensionAPI) {
     thinkingStartMs = null;
     lastRunMs = null;
     lastProviderResponseAt = null;
+    lastCachedTokens = 0;
+    lastCacheCostRates = null;
     pendingPromptText = "";
     pendingInputAt = null;
     uiPromptActive = false;
@@ -842,6 +904,13 @@ export default function promptTimer(pi: ExtensionAPI) {
     if (lastTurn) {
       lastProviderResponseAt = lastTurn.at + lastTurn.durationMs;
       lastRunMs = lastTurn.durationMs;
+    }
+    const lastUsage = findLastAssistantUsage(ctx.sessionManager.getEntries());
+    if (lastUsage) {
+      lastCachedTokens = lastUsage.cacheRead + lastUsage.cacheWrite;
+      lastCacheCostRates = ctx.model?.cost
+        ? { input: ctx.model.cost.input, cacheRead: ctx.model.cost.cacheRead, cacheWrite: ctx.model.cost.cacheWrite }
+        : null;
     }
 
     if (!ctx.hasUI) return;
@@ -869,6 +938,12 @@ export default function promptTimer(pi: ExtensionAPI) {
             // provider response.
             const st = cacheCountdown(lastProviderResponseAt, now);
             left = theme.fg(st.level, st.text);
+            if (st.level === "error") {
+              const estimate = estimateCacheMissCost(lastCachedTokens, lastCacheCostRates);
+              if (estimate !== null) {
+                left += theme.fg("error", `  · ~${formatEstimatedCost(estimate)} to rebuild`);
+              }
+            }
             left += theme.fg("dim", `  @${formatTimestamp(lastProviderResponseAt)}`);
           } else {
             left = theme.fg("dim", "—");
