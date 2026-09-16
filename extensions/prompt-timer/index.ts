@@ -5,17 +5,22 @@
  *   Footer (always visible, live-ticking every second)
  *     • Thinking  →  ⏱  1:23  started 14:32:05
  *     • Idle      →  ⌛ 4:32  · cache TTL expires in 0:28  @14:33:28  last: 15s
- *     • Idle ≥5m  →  red  ⚠ cache TTL expired
+ *     • Idle ≥5m  →  red  ⚠ cache TTL expired · idle 12m  @14:33:28
  *
  *   Title bar (only while a blocking prompt/overlay is open)
  *     The footer is occluded by prompt overlays (e.g. ask_user_question), so the
  *     cache-TTL countdown is mirrored into the terminal title bar, which no
- *     overlay can cover. Gated by MIRROR_TO_TITLE_DURING_PROMPTS.
+ *     overlay can cover. Gated by MIRROR_TO_TITLE_DURING_PROMPTS. If the overlay
+ *     is our own /timer history panel and the agent is still actively working
+ *     underneath it, the title shows the "still working" elapsed time instead
+ *     of the (possibly stale) idle countdown.
  *
  *   /timer command  +  ctrl+alt+t shortcut
  *     Opens a history overlay showing every turn's agent-response time with
- *     idle gaps > 30 s flagged as "waiting" rows (red past the cache TTL).
- *     Press → or w to write the history to a Markdown file.
+ *     idle gaps > 30 s flagged as "waiting" rows (amber past 4 minutes, red
+ *     past the 5-minute cache TTL, matching the footer's own bands). Press
+ *     → or w to switch to the write-to-file tab, cycle the export format
+ *     (Markdown / CSV / JSON), and write the history to disk.
  *
  * CACHE MODEL
  *   The prompt cache is server-side state whose TTL counts down from the last
@@ -57,6 +62,11 @@ const WAIT_THRESHOLD_MS = 30 * 1000;
 /** Visible chars of prompt text in the overlay list. */
 const PROMPT_PREVIEW = 55;
 
+/** Export formats offered on the "Write to file" tab, in cycle order. */
+const EXPORT_FORMATS = ["markdown", "csv", "json"] as const;
+const FORMAT_LABELS = ["Markdown", "CSV", "JSON"] as const;
+const FORMAT_EXTENSIONS: Record<ExportFormat, string> = { markdown: "md", csv: "csv", json: "json" };
+
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
@@ -73,7 +83,11 @@ type DisplayRow =
   | { kind: "wait"; ms: number }
   | { kind: "live"; promptText: string; startedAt: number };
 
-type OverlayResult = "close" | "write-auto" | "write-custom";
+type ExportFormat = (typeof EXPORT_FORMATS)[number];
+
+type OverlayResult =
+  | { kind: "close" }
+  | { kind: "write"; format: ExportFormat; target: "auto" | "custom" };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -93,12 +107,40 @@ export function formatDuration(ms: number): string {
   return `${sec}s`;
 }
 
+/**
+ * Coarse duration for spans where second-level precision no longer matters
+ * (for example, "how long has the cache been expired"). Drops seconds once
+ * the span reaches a minute, and drops minutes once it reaches an hour, so
+ * the number does not visually grow forever with jittery precision.
+ */
+export function formatDurationCoarse(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM > 0 ? `${h}h ${remM}m` : `${h}h`;
+}
+
 export function formatTimestamp(ms: number): string {
   const d = new Date(ms);
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
 type CacheLevel = "dim" | "warning" | "error";
+
+/**
+ * Severity band for an elapsed duration relative to the prompt-cache TTL:
+ * dim below the warn threshold, warning between warn and TTL, error at or
+ * past the TTL. Shared by the footer countdown and the history overlay's
+ * "waiting" rows so both surfaces agree on when to escalate color.
+ */
+export function cacheLevel(elapsedMs: number): CacheLevel {
+  if (elapsedMs >= CACHE_TTL_MS) return "error";
+  if (elapsedMs >= CACHE_WARN_MS) return "warning";
+  return "dim";
+}
 
 /**
  * Cache-TTL countdown text + severity, anchored to the last completed provider
@@ -108,15 +150,17 @@ type CacheLevel = "dim" | "warning" | "error";
  */
 export function cacheCountdown(sinceMs: number, now: number): { text: string; level: CacheLevel } {
   const elapsed = Math.max(0, now - sinceMs);
+  const level = cacheLevel(elapsed);
+  if (level === "error") {
+    const expiredFor = formatDurationCoarse(elapsed - CACHE_TTL_MS);
+    return { text: `⚠ cache TTL expired · idle ${expiredFor}`, level };
+  }
   const dur = formatDuration(elapsed);
-  if (elapsed >= CACHE_TTL_MS) {
-    return { text: `⌛ ${dur}  ⚠ cache TTL expired`, level: "error" };
-  }
-  if (elapsed >= CACHE_WARN_MS) {
+  if (level === "warning") {
     const rem = formatDuration(Math.max(0, CACHE_TTL_MS - elapsed));
-    return { text: `⌛ ${dur}  · cache TTL expires in ${rem}`, level: "warning" };
+    return { text: `⌛ ${dur}  · cache TTL expires in ${rem}`, level };
   }
-  return { text: `⌛ ${dur}`, level: "dim" };
+  return { text: `⌛ ${dur}`, level };
 }
 
 export function truncatePrompt(text: string): string {
@@ -211,6 +255,74 @@ function fillToWidth(s: string, w: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// History file rendering (Markdown / CSV / JSON)
+// ---------------------------------------------------------------------------
+
+export type HistoryFileMeta = { date: Date; sessionName?: string; cwd: string };
+
+export function renderHistoryMarkdown(history: TurnRecord[], meta: HistoryFileMeta): string {
+  const lines: string[] = ["# Timer History", "", `**Date:** ${meta.date.toLocaleString()}`];
+  if (meta.sessionName) lines.push(`**Session:** ${meta.sessionName}`);
+  lines.push(`**CWD:** ${meta.cwd}`, "", "---", "");
+
+  if (history.length === 0) {
+    lines.push("*(no history yet)*");
+  } else {
+    for (const rec of history) {
+      if (rec.waitBeforeMs >= WAIT_THRESHOLD_MS) {
+        lines.push(`⌛ ${formatDuration(rec.waitBeforeMs).padStart(5)}   waiting`);
+        lines.push("");
+      }
+      const dur = formatDuration(rec.durationMs).padStart(5);
+      lines.push(`${dur}  ↑  ${rec.promptText}   [${formatTimestamp(rec.at)}]`);
+      lines.push("");
+    }
+  }
+  return lines.join("\n");
+}
+
+function csvEscape(value: string): string {
+  return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+export function renderHistoryCsv(history: TurnRecord[]): string {
+  const header = "timestamp,duration_ms,duration,wait_before_ms,prompt";
+  const rows = history.map((rec) =>
+    [
+      formatTimestamp(rec.at),
+      String(rec.durationMs),
+      formatDuration(rec.durationMs),
+      String(rec.waitBeforeMs),
+      csvEscape(rec.promptText),
+    ].join(","),
+  );
+  return [header, ...rows].join("\n") + "\n";
+}
+
+export function renderHistoryJson(history: TurnRecord[], meta: HistoryFileMeta): string {
+  const payload = {
+    date: meta.date.toISOString(),
+    session: meta.sessionName ?? null,
+    cwd: meta.cwd,
+    turns: history.map((rec) => ({
+      at: new Date(rec.at).toISOString(),
+      timestamp: formatTimestamp(rec.at),
+      durationMs: rec.durationMs,
+      duration: formatDuration(rec.durationMs),
+      waitBeforeMs: rec.waitBeforeMs,
+      prompt: rec.promptText,
+    })),
+  };
+  return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+export function renderHistoryContent(format: ExportFormat, history: TurnRecord[], meta: HistoryFileMeta): string {
+  if (format === "csv") return renderHistoryCsv(history);
+  if (format === "json") return renderHistoryJson(history, meta);
+  return renderHistoryMarkdown(history, meta);
+}
+
+// ---------------------------------------------------------------------------
 // TimerHistoryComponent
 // ---------------------------------------------------------------------------
 
@@ -220,13 +332,15 @@ export class TimerHistoryComponent {
   private liveTimer: ReturnType<typeof setInterval> | null = null;
   /** Active tab: 0 = History, 1 = Write to file. */
   private tab: 0 | 1 = 0;
-  /** Write-to-file option: 0 = auto path, 1 = choose a relative path. */
-  private writeSelected: 0 | 1 = 0;
+  /** Write-to-file row: 0 = format, 1 = auto path, 2 = choose a relative path. */
+  private writeSelected: 0 | 1 | 2 = 1;
+  /** Index into EXPORT_FORMATS for the currently selected export format. */
+  private writeFormat: 0 | 1 | 2 = 0;
 
   constructor(
     history: TurnRecord[],
     liveEntry: { promptText: string; startedAt: number } | null,
-    private readonly autoPath: string,
+    private readonly sessionName: string | undefined,
     private readonly tui: TUI,
     private readonly theme: Theme,
     private readonly doneFn: (result: OverlayResult) => void,
@@ -262,6 +376,14 @@ export class TimerHistoryComponent {
     this.doneFn(result);
   }
 
+  private currentFormat(): ExportFormat {
+    return EXPORT_FORMATS[this.writeFormat]!;
+  }
+
+  private currentAutoPath(): string {
+    return buildDefaultPath(this.sessionName, this.currentFormat());
+  }
+
   /** Draw the top tab strip (History │ Write to file); active tab highlighted. */
   private renderTabStrip(innerWidth: number): string {
     const t = this.theme;
@@ -283,7 +405,7 @@ export class TimerHistoryComponent {
   private setTab(tab: 0 | 1): void {
     if (this.tab === tab) return;
     this.tab = tab;
-    if (tab === 1) this.writeSelected = 0;
+    if (tab === 1) this.writeSelected = 1; // land on the primary "save" action
     this.tui.requestRender(true); // structural change → full repaint
   }
 
@@ -294,10 +416,14 @@ export class TimerHistoryComponent {
 
     if (row.kind === "wait") {
       const dur = formatDuration(row.ms).padStart(5);
-      // Red once the idle gap exceeded the prompt-cache TTL — the cache was
-      // gone by the time the next prompt landed.
-      if (row.ms >= CACHE_TTL_MS) {
+      // Same dim → amber → red escalation the footer uses, so a "waiting" row
+      // signals how close (or how far past) the cache TTL it ran.
+      const level = cacheLevel(row.ms);
+      if (level === "error") {
         return prefix + fillToWidth(t.fg("error", `${dur}  ⌛  waiting · cache TTL expired`), contentWidth);
+      }
+      if (level === "warning") {
+        return prefix + fillToWidth(t.fg("warning", `${dur}  ⌛  waiting`), contentWidth);
       }
       return prefix + fillToWidth(t.fg("dim", `${dur}  ⌛  waiting`), contentWidth);
     }
@@ -339,27 +465,49 @@ export class TimerHistoryComponent {
     // ── Tab body ────────────────────────────────────────────────────────────
     const content: string[] = [];
     if (this.tab === 0) {
+      const waitS = WAIT_THRESHOLD_MS / 1000;
+      const ttlMin = CACHE_TTL_MS / 60_000;
+      content.push(
+        fillToWidth(t.fg("dim", `   waiting ≥ ${waitS}s · red once past the ${ttlMin}-minute cache TTL`), innerWidth),
+      );
       if (this.rows.length === 0) {
+        content.push(" ".repeat(innerWidth));
         content.push(fillToWidth(t.fg("dim", "   (no history yet)"), innerWidth));
+        content.push(fillToWidth(t.fg("dim", "   Send a prompt to start tracking timing."), innerWidth));
       } else {
+        const listRows = CONTENT_ROWS - content.length;
         this.selected = Math.max(0, Math.min(this.selected, this.rows.length - 1));
-        const scrollStart = Math.max(0, this.selected - CONTENT_ROWS + 1);
-        const visible = this.rows.slice(scrollStart, scrollStart + CONTENT_ROWS);
+        const scrollStart = Math.max(0, this.selected - listRows + 1);
+        const visible = this.rows.slice(scrollStart, scrollStart + listRows);
         for (let i = 0; i < visible.length; i++) {
           const isActive = scrollStart + i === this.selected;
           content.push(fillToWidth(this.renderRow(visible[i]!, isActive, innerWidth), innerWidth));
         }
       }
     } else {
-      content.push(fillToWidth(t.fg("dim", "   Save the timer history as a Markdown file:"), innerWidth));
+      content.push(fillToWidth(t.fg("dim", "   Save the timer history as:"), innerWidth));
       content.push(" ".repeat(innerWidth));
-      const optionRow = (idx: 0 | 1, label: string): string => {
+
+      const formatRow = (): string => {
+        const active = this.writeSelected === 0;
+        const prefix = active ? t.fg("accent", "  ❯ ") : "    ";
+        let chips = t.fg("dim", "Format:  ");
+        for (let i = 0; i < FORMAT_LABELS.length; i++) {
+          if (i > 0) chips += t.fg("dim", " │ ");
+          chips += i === this.writeFormat ? t.fg("accent", FORMAT_LABELS[i]!) : t.fg("dim", FORMAT_LABELS[i]!);
+        }
+        return prefix + chips;
+      };
+      content.push(fillToWidth(formatRow(), innerWidth));
+      content.push(" ".repeat(innerWidth));
+
+      const optionRow = (idx: 1 | 2, label: string): string => {
         const active = this.writeSelected === idx;
         const prefix = active ? t.fg("accent", "  ❯ ") : "    ";
         return prefix + (active ? t.fg("accent", label) : t.fg("dim", label));
       };
-      content.push(fillToWidth(optionRow(0, truncateToWidth(this.autoPath, innerWidth - 6)), innerWidth));
-      content.push(fillToWidth(optionRow(1, "Choose a relative path…"), innerWidth));
+      content.push(fillToWidth(optionRow(1, truncateToWidth(this.currentAutoPath(), innerWidth - 6)), innerWidth));
+      content.push(fillToWidth(optionRow(2, "Choose a relative path…"), innerWidth));
     }
 
     while (content.length < CONTENT_ROWS) content.push(" ".repeat(innerWidth));
@@ -369,16 +517,19 @@ export class TimerHistoryComponent {
     lines.push(border("└") + border("─".repeat(innerWidth)) + border("┘"));
 
     // ── Hint line (below the box) ────────────────────────────────────────────
-    const hint = this.tab === 0
-      ? "  ↑↓ / j k  navigate  ·  → / tab  write to file  ·  esc / q  close  "
-      : "  ↑↓  select  ·  enter  save  ·  ← / tab  history  ·  esc  close  ";
+    const hint =
+      this.tab === 0
+        ? "  ↑↓ / j k  navigate  ·  →  write to file  ·  tab  switch tabs  ·  esc / q  close  "
+        : this.writeSelected === 0
+          ? "  ↑↓  select  ·  enter  cycle format  ·  ←  history  ·  esc  close  "
+          : "  ↑↓  select  ·  enter  save  ·  ←  history  ·  esc  close  ";
     lines.push(t.fg("dim", truncateToWidth(hint, width)));
     return lines;
   }
 
   handleInput(data: string): void {
     if (matchesKey(data, Key.escape) || data === "q" || matchesKey(data, Key.ctrl("c"))) {
-      this.done("close");
+      this.done({ kind: "close" });
       return;
     }
     // Tab strip navigation
@@ -400,15 +551,25 @@ export class TimerHistoryComponent {
     }
 
     if (this.tab === 1) {
-      // Write-to-file options
+      // Write-to-file rows: 0 = format, 1 = auto path, 2 = custom path. Up/down
+      // wraps since it is a short cyclic menu.
       if (matchesKey(data, Key.up)) {
-        this.writeSelected = 0;
+        this.writeSelected = this.writeSelected === 0 ? 2 : ((this.writeSelected - 1) as 0 | 1 | 2);
         this.tui.requestRender();
       } else if (matchesKey(data, Key.down)) {
-        this.writeSelected = 1;
+        this.writeSelected = this.writeSelected === 2 ? 0 : ((this.writeSelected + 1) as 0 | 1 | 2);
         this.tui.requestRender();
       } else if (matchesKey(data, Key.enter)) {
-        this.done(this.writeSelected === 0 ? "write-auto" : "write-custom");
+        if (this.writeSelected === 0) {
+          this.writeFormat = ((this.writeFormat + 1) % EXPORT_FORMATS.length) as 0 | 1 | 2;
+          this.tui.requestRender();
+        } else {
+          this.done({
+            kind: "write",
+            format: this.currentFormat(),
+            target: this.writeSelected === 1 ? "auto" : "custom",
+          });
+        }
       }
       return;
     }
@@ -433,7 +594,7 @@ export class TimerHistoryComponent {
 // File writing
 // ---------------------------------------------------------------------------
 
-export function buildDefaultPath(sessionName: string | undefined): string {
+export function buildDefaultPath(sessionName: string | undefined, format: ExportFormat = "markdown"): string {
   const now = new Date();
   const date = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
   const time = `${pad2(now.getHours())}-${pad2(now.getMinutes())}`;
@@ -446,8 +607,9 @@ export function buildDefaultPath(sessionName: string | undefined): string {
           .replace(/^-+|-+$/g, "")
       : "";
   const slug = core.length > 0 ? `-${core}` : "";
+  const ext = FORMAT_EXTENSIONS[format];
   // Return a cwd-relative path so it fits in the overlay without truncation.
-  return nodePath.join(".scratch", `timer-${date}-${time}${slug}.md`);
+  return nodePath.join(".scratch", `timer-${date}-${time}${slug}.${ext}`);
 }
 
 async function writeHistoryFile(
@@ -455,35 +617,14 @@ async function writeHistoryFile(
   cwd: string,
   history: TurnRecord[],
   sessionName: string | undefined,
+  format: ExportFormat,
 ): Promise<void> {
   // filePath is always cwd-relative (auto path or a caller-validated custom
   // path), so resolve it against cwd; the project dir contains the output.
   const resolved = nodePath.resolve(cwd, filePath);
-  const now = new Date();
-  const lines: string[] = [
-    "# Timer History",
-    "",
-    `**Date:** ${now.toLocaleString()}`,
-  ];
-  if (sessionName) lines.push(`**Session:** ${sessionName}`);
-  lines.push(`**CWD:** ${cwd}`, "", "---", "");
-
-  if (history.length === 0) {
-    lines.push("*(no history yet)*");
-  } else {
-    for (const rec of history) {
-      if (rec.waitBeforeMs >= WAIT_THRESHOLD_MS) {
-        lines.push(`⌛ ${formatDuration(rec.waitBeforeMs).padStart(5)}   waiting`);
-        lines.push("");
-      }
-      const dur = formatDuration(rec.durationMs).padStart(5);
-      lines.push(`${dur}  ↑  ${rec.promptText}   [${formatTimestamp(rec.at)}]`);
-      lines.push("");
-    }
-  }
-
+  const body = renderHistoryContent(format, history, { date: new Date(), sessionName, cwd });
   await nodeFs.promises.mkdir(nodePath.dirname(resolved), { recursive: true });
-  await nodeFs.promises.writeFile(resolved, lines.join("\n"), "utf8");
+  await nodeFs.promises.writeFile(resolved, body, "utf8");
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +643,11 @@ export default function promptTimer(pi: ExtensionAPI) {
   let pendingInputAt: number | null = null;
   // True while a blocking user-facing prompt/overlay is open.
   let uiPromptActive = false;
+  // True specifically while our own /timer history overlay is open. Lets the
+  // title mirror distinguish "the agent is still working underneath our own
+  // panel" from "the agent itself opened a blocking prompt (ask_user_question)",
+  // which the footer already treats as an idle/cache-countdown state.
+  let ownOverlayOpen = false;
 
   let footerTui: { requestRender(): void } | null = null;
   let titleUi: { setTitle(t: string): void } | null = null;
@@ -516,9 +662,14 @@ export default function promptTimer(pi: ExtensionAPI) {
     return safeName ? `π - ${safeName} - ${cwd}` : `π - ${cwd}`;
   }
 
-  /** Paint the cache-TTL countdown into the title while a prompt is open. */
+  /** Paint the cache-TTL countdown (or "still working") into the title while a prompt is open. */
   function refreshPromptTitle(): void {
     if (!titleUi) return;
+    if (ownOverlayOpen && thinkingStartMs !== null) {
+      const elapsed = Date.now() - thinkingStartMs;
+      titleUi.setTitle(`⏱ ${formatDuration(elapsed)}  ·  ${baseTitle()}`);
+      return;
+    }
     if (lastProviderResponseAt === null) {
       titleUi.setTitle(baseTitle());
       return;
@@ -569,47 +720,56 @@ export default function promptTimer(pi: ExtensionAPI) {
       ? allTurns.filter((tn) => tn.at !== liveEntry.startedAt)
       : allTurns;
 
-    const sessionName = pi.getSessionName();
-    const autoPath = buildDefaultPath(sessionName ?? undefined);
+    const sessionName = pi.getSessionName() ?? undefined;
 
-    const result = await ctx.ui.custom<OverlayResult>(
-      (tui, theme, _kb, done) =>
-        new TimerHistoryComponent(history, liveEntry, autoPath, tui, theme, done),
-      {
-        overlay: true,
-        overlayOptions: { width: "72%", minWidth: 54, maxHeight: "80%", anchor: "center" },
-      },
-    );
-
-    if (result === "write-auto") {
-      try {
-        await writeHistoryFile(autoPath, ctx.cwd, history, sessionName ?? undefined);
-        ctx.ui.notify(`Saved → ${nodePath.resolve(ctx.cwd, autoPath)}`, "info");
-      } catch (err) {
-        ctx.ui.notify(`Write failed: ${(err as Error).message}`, "error");
-      }
-    } else if (result === "write-custom") {
-      const input = await ctx.ui.input(
-        "Save timer history — path relative to the project directory",
-        autoPath,
+    let result: OverlayResult;
+    ownOverlayOpen = true;
+    try {
+      result = await ctx.ui.custom<OverlayResult>(
+        (tui, theme, _kb, done) => new TimerHistoryComponent(history, liveEntry, sessionName, tui, theme, done),
+        {
+          overlay: true,
+          overlayOptions: { width: "72%", minWidth: 54, maxHeight: "80%", anchor: "center" },
+        },
       );
-      const rel = input?.trim();
-      if (!rel) return;
-      // Confine the custom path to inside cwd: no absolute paths, no `..` escapes.
-      const resolved = resolveWithinCwd(ctx.cwd, rel);
-      if (!resolved) {
-        ctx.ui.notify(
-          "Path must be relative to the project directory (no absolute or ../ paths).",
-          "error",
-        );
-        return;
-      }
+    } finally {
+      ownOverlayOpen = false;
+    }
+
+    if (result.kind !== "write") return;
+
+    const path = result.target === "auto" ? buildDefaultPath(sessionName, result.format) : null;
+    if (path !== null) {
       try {
-        await writeHistoryFile(rel, ctx.cwd, history, sessionName ?? undefined);
-        ctx.ui.notify(`Saved → ${resolved}`, "info");
+        await writeHistoryFile(path, ctx.cwd, history, sessionName, result.format);
+        ctx.ui.notify(`Saved → ${nodePath.resolve(ctx.cwd, path)}`, "info");
       } catch (err) {
         ctx.ui.notify(`Write failed: ${(err as Error).message}`, "error");
       }
+      return;
+    }
+
+    const suggested = buildDefaultPath(sessionName, result.format);
+    const input = await ctx.ui.input(
+      "Save timer history — path relative to the project directory",
+      suggested,
+    );
+    const rel = input?.trim();
+    if (!rel) return;
+    // Confine the custom path to inside cwd: no absolute paths, no `..` escapes.
+    const resolved = resolveWithinCwd(ctx.cwd, rel);
+    if (!resolved) {
+      ctx.ui.notify(
+        "Path must be relative to the project directory (no absolute or ../ paths).",
+        "error",
+      );
+      return;
+    }
+    try {
+      await writeHistoryFile(rel, ctx.cwd, history, sessionName, result.format);
+      ctx.ui.notify(`Saved → ${resolved}`, "info");
+    } catch (err) {
+      ctx.ui.notify(`Write failed: ${(err as Error).message}`, "error");
     }
   }
 
@@ -672,6 +832,7 @@ export default function promptTimer(pi: ExtensionAPI) {
     pendingPromptText = "";
     pendingInputAt = null;
     uiPromptActive = false;
+    ownOverlayOpen = false;
 
     // Restore the cache anchor from the transcript so /reload (which preserves
     // context, hence the live prompt cache) keeps the cache-TTL clock ticking.
@@ -732,6 +893,7 @@ export default function promptTimer(pi: ExtensionAPI) {
     footerTui = null;
     thinkingStartMs = null;
     uiPromptActive = false;
+    ownOverlayOpen = false;
     if (ctx.hasUI) {
       ctx.ui.setFooter(undefined);
       if (MIRROR_TO_TITLE_DURING_PROMPTS) ctx.ui.setTitle(baseTitle());
