@@ -3,6 +3,38 @@
 All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Author attribution**: `package.json` now declares `"author": "Jon Leemon"`.
+- **Estimated cache-miss cost**: once the footer's cache-TTL countdown expires, it appends a labeled
+  estimate of the cost to rebuild the cache (for example `~$0.08 to rebuild`), computed from the last
+  response's actual cache token usage and the model's per-million-token cost rates. Uses the model's
+  cache-write rate when the provider charges one (Anthropic-style explicit caching), falling back to
+  the plain input rate when it doesn't (OpenAI/Gemini-style implicit caching). Shows nothing — not a
+  misleading `$0.00` — when there were no cached tokens or the model reports no pricing. Restored from
+  the transcript on `/reload`.
+- History overlay: a caption line on the **History** tab now states the waiting (30s) and cache-TTL
+  (5 min) thresholds so the color coding is self-explanatory.
+- Write-to-file: a new **Format** row cycles Markdown / CSV / JSON with `enter`; the auto-path preview
+  updates its extension live. CSV rows are comma/quote/newline-escaped; JSON is parseable structured
+  output.
+
+### Changed
+
+- Footer/title: once the cache TTL has expired, the countdown switches from a raw, ever-growing
+  second-precision stopwatch to a coarse "idle for" duration (seconds, then minutes, then hours+minutes).
+- History overlay: "waiting" rows now escalate through the same dim → amber → red bands as the footer
+  (amber past 4 minutes, red past the 5-minute cache TTL) instead of being binary dim/red.
+- History overlay: the empty state now hints to send a prompt to start tracking, instead of a bare
+  `(no history yet)`.
+- Title-bar mirror: if you open the `/timer` overlay itself while the agent is still actively working
+  underneath it, the title now shows the "still working" elapsed time instead of a possibly-stale idle
+  cache countdown, since the agent has not actually gone idle in that case.
+- Tab-strip hint text on the write-to-file tab now differs by selected row ("cycle format" vs "save")
+  instead of one static line.
+
 ## [0.1.0] - 2026-09-10
 
 ### Added
