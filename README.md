@@ -65,7 +65,16 @@ The footer updates every second and reflects one of three states:
   |---------|-------|---------|
   | < 4 min | dim | `⌛ 2:45  @14:33:28   last: 1:23` |
   | 4–5 min | amber | `⌛ 4:12  · cache TTL expires in 0:48` |
-  | ≥ 5 min | red | `⌛ 5:03  ⚠ cache TTL expired` |
+  | ≥ 5 min | red | `⚠ cache TTL expired · idle 12m  · ~$0.08 to rebuild  @14:33:28` |
+
+  Once the cache has expired, the countdown switches from second-precision elapsed time to a coarse
+  "idle for" duration (seconds, then whole minutes, then hours+minutes) so the number does not keep growing
+  with jittery precision the longer you stay away.
+
+  The `~$0.08 to rebuild` figure is a labeled **estimate**, not a metered cost: it multiplies the tokens read from
+  cache on the last response by the gap between the model's cache-write and cache-read rates (falling back to the
+  plain input rate for providers that don't charge a separate cache-write fee). It only appears once the model reports
+  pricing — local or unknown models show nothing rather than a misleading `$0.00`.
 
 - **Fresh session** — a single `—` until the first turn completes.
 
@@ -86,9 +95,11 @@ ctrl+alt+t
 ```
 
 The overlay is a centered floating modal with a header strip of two tabs — **History** and **Write to file** — modeled
-on pi-copy-code's response tabs. The **History** tab lists one row per turn (the agent's response time and a preview of
-your prompt), with idle gaps longer than 30 seconds shown as `waiting` rows (red once they exceed the 5-minute cache
-TTL). An in-progress turn appears as a live row at the bottom.
+on pi-copy-code's response tabs. The **History** tab shows the waiting/expiry thresholds in a caption line, then lists
+one row per turn (the agent's response time and a preview of your prompt). Idle gaps longer than 30 seconds appear as
+`waiting` rows, colored with the same dim → amber → red bands as the footer (amber past 4 minutes, red past the
+5-minute cache TTL). An in-progress turn appears as a live row at the bottom. An empty session shows a short hint to
+send a prompt to start tracking.
 
 When the overlay is open:
 
@@ -98,23 +109,28 @@ When the overlay is open:
 
 ### Write history to a file
 
-Switch to the **Write to file** tab (`→` or `tab`) and pick an option with `↑` / `↓`, then `enter`:
+Switch to the **Write to file** tab (`→` or `tab`) and use `↑` / `↓` to move between three rows:
 
-- **Auto path** — `.scratch/timer-<date>[-session].md`, relative to the current working directory; press `enter` to
-  write immediately.
-- **Choose a relative path** — opens an input pre-filled with the auto path. The destination must be **relative to the
-  project directory**; absolute paths and `../` escapes are rejected. The save confirmation shows the full resolved
-  path so the destination is unambiguous.
+- **Format** — cycles Markdown / CSV / JSON with `enter`. The auto path preview updates its extension live as you
+  cycle.
+- **Auto path** — `.scratch/timer-<date>[-session].<ext>`, relative to the current working directory; press `enter`
+  to write immediately in the selected format.
+- **Choose a relative path** — opens an input pre-filled with the auto path (matching extension). The destination
+  must be **relative to the project directory**; absolute paths and `../` escapes are rejected. The save confirmation
+  shows the full resolved path so the destination is unambiguous.
 
-The file records each turn's timestamp, response duration, and prompt preview, with `waiting` markers for idle gaps. The
-`.scratch/` directory is created automatically if it does not exist.
+Each format records every turn's timestamp, response duration, and prompt preview, with `waiting` markers for idle
+gaps (Markdown), a dedicated column (CSV, comma/quote/newline-escaped), or structured fields (JSON). The `.scratch/`
+directory is created automatically if it does not exist.
 
 ### Cache-TTL clock during questions
 
 While a blocking prompt or overlay is open (for example an `ask_user_question` questionnaire), the footer is covered by
 that overlay, so the cache-TTL countdown is mirrored into the terminal title bar — which no overlay can occlude. The
-title is restored when the prompt closes. Set `MIRROR_TO_TITLE_DURING_PROMPTS` to `false` at the top of the extension to
-disable this.
+title is restored when the prompt closes. If you open the `/timer` overlay itself while the agent is still actively
+working underneath it, the title shows the "still working" elapsed time instead of the idle countdown, since in that
+case the agent has not actually gone idle. Set `MIRROR_TO_TITLE_DURING_PROMPTS` to `false` at the top of the extension
+to disable this.
 
 ## How the cache clock works
 

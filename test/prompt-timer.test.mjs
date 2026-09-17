@@ -8,8 +8,23 @@ import { createJiti } from "jiti";
 // directly here.
 const jiti = createJiti(import.meta.url, { moduleCache: false });
 const extensionPath = fileURLToPath(new URL("../extensions/prompt-timer/index.ts", import.meta.url));
-const { formatDuration, cacheCountdown, truncatePrompt, buildDefaultPath, reconstructHistory, stripControlChars, resolveWithinCwd } =
-  await jiti.import(extensionPath);
+const {
+  formatDuration,
+  formatDurationCoarse,
+  cacheLevel,
+  cacheCountdown,
+  estimateCacheMissCost,
+  formatEstimatedCost,
+  truncatePrompt,
+  buildDefaultPath,
+  reconstructHistory,
+  findLastAssistantUsage,
+  stripControlChars,
+  resolveWithinCwd,
+  renderHistoryMarkdown,
+  renderHistoryCsv,
+  renderHistoryJson,
+} = await jiti.import(extensionPath);
 
 test("formatDuration renders seconds, m:ss, and h:mm:ss", () => {
   assert.equal(formatDuration(0), "0s");
@@ -30,6 +45,80 @@ test("cacheCountdown moves through dim, warning, and error bands", () => {
   const error = cacheCountdown(base, base + 5 * 60_000 + 1_000);
   assert.equal(error.level, "error");
   assert.match(error.text, /cache TTL expired/);
+  assert.match(error.text, /idle 1s/);
+});
+
+test("cacheCountdown reports expiry age with coarse, non-growing-precision duration", () => {
+  const base = 1_700_000_000_000;
+  const expiredFor58m = cacheCountdown(base, base + 5 * 60_000 + 58 * 60_000);
+  assert.match(expiredFor58m.text, /idle 58m/);
+
+  const expiredFor1h5m = cacheCountdown(base, base + 5 * 60_000 + 65 * 60_000);
+  assert.match(expiredFor1h5m.text, /idle 1h 5m/);
+});
+
+test("cacheLevel matches the bands cacheCountdown uses", () => {
+  assert.equal(cacheLevel(0), "dim");
+  assert.equal(cacheLevel(4 * 60_000 - 1), "dim");
+  assert.equal(cacheLevel(4 * 60_000), "warning");
+  assert.equal(cacheLevel(5 * 60_000 - 1), "warning");
+  assert.equal(cacheLevel(5 * 60_000), "error");
+});
+
+test("formatDurationCoarse drops seconds past a minute and minutes past an hour", () => {
+  assert.equal(formatDurationCoarse(45_000), "45s");
+  assert.equal(formatDurationCoarse(59_000), "59s");
+  assert.equal(formatDurationCoarse(60_000), "1m");
+  assert.equal(formatDurationCoarse(58 * 60_000 + 40_000), "58m");
+  assert.equal(formatDurationCoarse(60 * 60_000), "1h");
+  assert.equal(formatDurationCoarse(65 * 60_000), "1h 5m");
+});
+
+test("estimateCacheMissCost uses the cache-write rate when the provider charges one", () => {
+  // Anthropic-style: cacheRead cheap, cacheWrite pricier than plain input.
+  const rates = { input: 3, cacheRead: 0.3, cacheWrite: 3.75 }; // $/1M tokens
+  const cost = estimateCacheMissCost(100_000, rates);
+  assert.ok(cost !== null);
+  // (3.75 - 0.3) * 100_000 / 1_000_000 = 0.345
+  assert.ok(Math.abs(cost - 0.345) < 1e-9, `expected ~0.345, got ${cost}`);
+});
+
+test("estimateCacheMissCost falls back to the input rate when there is no cache-write rate", () => {
+  // OpenAI/Gemini-style implicit caching: no separate write fee, a miss just
+  // means those tokens become plain input tokens again.
+  const rates = { input: 2, cacheRead: 0.5, cacheWrite: 0 };
+  const cost = estimateCacheMissCost(200_000, rates);
+  assert.ok(cost !== null);
+  // (2 - 0.5) * 200_000 / 1_000_000 = 0.3
+  assert.ok(Math.abs(cost - 0.3) < 1e-9, `expected ~0.3, got ${cost}`);
+});
+
+test("estimateCacheMissCost returns null when there is nothing to estimate", () => {
+  assert.equal(estimateCacheMissCost(0, { input: 3, cacheRead: 0.3, cacheWrite: 3.75 }), null);
+  assert.equal(estimateCacheMissCost(100_000, null), null);
+  assert.equal(estimateCacheMissCost(100_000, { input: 0, cacheRead: 0, cacheWrite: 0 }), null);
+  // cacheRead >= the miss rate (unusual, but should never report a negative cost)
+  assert.equal(estimateCacheMissCost(100_000, { input: 1, cacheRead: 5, cacheWrite: 0 }), null);
+});
+
+test("formatEstimatedCost floors tiny amounts and rounds to cents otherwise", () => {
+  assert.equal(formatEstimatedCost(0.004), "<$0.01");
+  assert.equal(formatEstimatedCost(0.01), "$0.01");
+  assert.equal(formatEstimatedCost(1.014), "$1.01");
+});
+
+test("findLastAssistantUsage returns the most recent assistant message's cache usage", () => {
+  const entry = (role, usage) => ({ type: "message", message: { role, usage } });
+  assert.equal(findLastAssistantUsage([]), null);
+  assert.equal(findLastAssistantUsage([entry("user", undefined)]), null);
+
+  const entries = [
+    entry("user", undefined),
+    entry("assistant", { cacheRead: 1_000, cacheWrite: 200 }),
+    entry("user", undefined),
+    entry("assistant", { cacheRead: 5_000, cacheWrite: 0 }),
+  ];
+  assert.deepEqual(findLastAssistantUsage(entries), { cacheRead: 5_000, cacheWrite: 0 });
 });
 
 test("truncatePrompt keeps the first line and bounds the length", () => {
@@ -45,6 +134,12 @@ test("truncatePrompt keeps the first line and bounds the length", () => {
 test("buildDefaultPath yields a cwd-relative .scratch path with an optional slug", () => {
   assert.match(buildDefaultPath(undefined), /^\.scratch\/timer-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}\.md$/);
   assert.match(buildDefaultPath("My Session!"), /^\.scratch\/timer-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-my-session\.md$/);
+});
+
+test("buildDefaultPath picks the extension for the requested export format", () => {
+  assert.match(buildDefaultPath(undefined, "markdown"), /\.md$/);
+  assert.match(buildDefaultPath(undefined, "csv"), /\.csv$/);
+  assert.match(buildDefaultPath(undefined, "json"), /\.json$/);
 });
 
 test("reconstructHistory derives turns, durations, and wait gaps from the transcript", () => {
@@ -87,6 +182,51 @@ test("stripControlChars removes escape/control bytes", () => {
   assert.equal(stripControlChars("hello"), "hello");
   assert.equal(stripControlChars("a\x1b]0;evilb"), "a]0;evilb");
   assert.equal(stripControlChars("tab\tbell\x07nul\x00"), "tabbellnul");
+});
+
+test("renderHistoryMarkdown includes waiting rows and turn rows", () => {
+  const meta = { date: new Date("2026-01-01T12:00:00.000Z"), sessionName: "my-session", cwd: "/repo" };
+  const history = [
+    { promptText: "first", durationMs: 5_000, waitBeforeMs: 0, at: Date.parse("2026-01-01T12:00:00.000Z") },
+    { promptText: "second", durationMs: 3_000, waitBeforeMs: 60_000, at: Date.parse("2026-01-01T12:05:00.000Z") },
+  ];
+  const out = renderHistoryMarkdown(history, meta);
+  assert.match(out, /# Timer History/);
+  assert.match(out, /\*\*Session:\*\* my-session/);
+  assert.match(out, /\*\*CWD:\*\* \/repo/);
+  assert.match(out, /waiting/);
+  assert.match(out, /first/);
+  assert.match(out, /second/);
+});
+
+test("renderHistoryMarkdown handles empty history", () => {
+  const meta = { date: new Date(), cwd: "/repo" };
+  assert.match(renderHistoryMarkdown([], meta), /\(no history yet\)/);
+});
+
+test("renderHistoryCsv emits a header row and escapes commas/quotes/newlines", () => {
+  const history = [
+    { promptText: 'has, comma "and quotes"', durationMs: 1_500, waitBeforeMs: 0, at: Date.parse("2026-01-01T00:00:00.000Z") },
+  ];
+  const out = renderHistoryCsv(history);
+  const lines = out.trim().split("\n");
+  assert.equal(lines[0], "timestamp,duration_ms,duration,wait_before_ms,prompt");
+  // Timestamp formatting is local-time (formatTimestamp), so only assert its
+  // shape here; duration/wait/prompt fields are timezone-independent.
+  assert.match(lines[1], /^\d{2}:\d{2}:\d{2},1500,1s,0,"has, comma ""and quotes"""$/);
+});
+
+test("renderHistoryJson round-trips turn data as parseable JSON", () => {
+  const meta = { date: new Date("2026-01-01T00:00:00.000Z"), sessionName: "s", cwd: "/repo" };
+  const history = [
+    { promptText: "hi", durationMs: 2_000, waitBeforeMs: 0, at: Date.parse("2026-01-01T00:00:00.000Z") },
+  ];
+  const parsed = JSON.parse(renderHistoryJson(history, meta));
+  assert.equal(parsed.session, "s");
+  assert.equal(parsed.cwd, "/repo");
+  assert.equal(parsed.turns.length, 1);
+  assert.equal(parsed.turns[0].prompt, "hi");
+  assert.equal(parsed.turns[0].durationMs, 2_000);
 });
 
 test("resolveWithinCwd confines custom paths to cwd", () => {
