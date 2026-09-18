@@ -20,7 +20,11 @@
  *   /timer command  +  ctrl+alt+t shortcut
  *     Opens a history overlay showing every turn's agent-response time with
  *     idle gaps > 30 s flagged as "waiting" rows (amber past 4 minutes, red
- *     past the 5-minute cache TTL, matching the footer's own bands). Press
+ *     past the 5-minute cache TTL, matching the footer's own bands). A turn
+ *     that re-warmed an expired cache (idle gap ≥ TTL) carries a "rewarm"
+ *     badge with its cost — metered when the provider reported a cache-write
+ *     charge, marked "(est.)" when estimated from token counts — and a
+ *     session rewarm total is pinned to the bottom of the box. Press
  *     → or w to switch to the write-to-file tab, cycle the export format
  *     (Markdown / CSV / JSON), and write the history to disk.
  *
@@ -78,6 +82,20 @@ type TurnRecord = {
   durationMs: number;   // time from user pressing Enter → agent_settled
   waitBeforeMs: number; // idle gap between previous agent_settled and this Enter
   at: number;           // wall-clock ms of the Enter event
+  rewarm?: RewarmRecord; // present when this turn re-warmed an expired cache
+};
+
+/**
+ * What one rewarm cost. `metered` means `usd` is the billed cache-write cost
+ * reported by the provider; `false` means it is an estimate from token counts
+ * and current model rates (implicit-caching providers report no cache-write
+ * cost, so the rewarmed prefix is indistinguishable inside plain input).
+ */
+export type RewarmRecord = {
+  tokens: number;   // cacheWrite tokens (explicit caching) or input tokens (implicit fallback)
+  usd: number;
+  metered: boolean;
+  model?: string;   // model that produced the turn's first assistant response
 };
 
 type DisplayRow =
@@ -198,6 +216,17 @@ export function formatEstimatedCost(usd: number): string {
   return usd < 0.01 ? "<$0.01" : `$${usd.toFixed(2)}`;
 }
 
+/**
+ * Short badge for a rewarm turn: metered cost shown plainly, estimated cost
+ * marked with "~" and "(est.)" so retrospective actuals and estimates are
+ * never visually indistinguishable.
+ */
+export function formatRewarmBadge(rewarm: RewarmRecord): string {
+  return rewarm.metered
+    ? `rewarm ${formatEstimatedCost(rewarm.usd)}`
+    : `rewarm ~${formatEstimatedCost(rewarm.usd)} (est.)`;
+}
+
 export function truncatePrompt(text: string): string {
   const first = text.split("\n")[0] ?? text;
   return first.length <= PROMPT_PREVIEW ? first : first.slice(0, PROMPT_PREVIEW - 1) + "…";
@@ -227,6 +256,57 @@ export function resolveWithinCwd(cwd: string, rel: string): string | null {
 }
 
 /**
+ * Decide whether a turn re-warmed an expired prompt cache, and at what cost.
+ * Gated on the idle gap before the prompt reaching the cache TTL — the first
+ * turn of a session has no gap (waitBeforeMs 0) and so is never flagged, since
+ * a cold start is unavoidable rather than a rewarm. The gap is the signal; the
+ * first assistant response's usage is the magnitude. Only that first response
+ * counts: later assistant messages in a multi-step turn write cache
+ * incrementally as part of normal operation, not as rewarm waste.
+ *
+ * Metered path: the provider billed an explicit cache write, so `usd` is the
+ * reported cost.cacheWrite (priced with that message's own model, which keeps
+ * it correct across mid-session model switches). Fallback: no cache write was
+ * reported (OpenAI/Gemini-style implicit caching, or missing cost data), so
+ * estimate from token counts and the current model's rates, marked unmetered.
+ * Returns undefined when there is nothing meaningful to report.
+ */
+export function rewarmForTurn(
+  firstAssistant: { input: number; cacheWrite: number; cacheWriteCost: number; model?: string } | null,
+  waitBeforeMs: number,
+  fallbackRates: CacheCostRates | null,
+): RewarmRecord | undefined {
+  if (!firstAssistant || waitBeforeMs < CACHE_TTL_MS) return undefined;
+  const { input, cacheWrite, cacheWriteCost, model } = firstAssistant;
+  if (cacheWrite > 0 && cacheWriteCost > 0) {
+    return { tokens: cacheWrite, usd: cacheWriteCost, metered: true, model };
+  }
+  const tokens = cacheWrite > 0 ? cacheWrite : input;
+  const usd = estimateCacheMissCost(tokens, fallbackRates);
+  if (usd === null) return undefined;
+  return { tokens, usd, metered: false, model };
+}
+
+/**
+ * Sum the rewarm cost across a history. Returns null when no turn re-warmed
+ * the cache. The total is unmetered if ANY contributing turn was estimated,
+ * so callers must label a mixed total as an estimate rather than silently
+ * blending metered and estimated dollars.
+ */
+export function totalRewarmCost(history: readonly TurnRecord[]): { usd: number; metered: boolean } | null {
+  let usd = 0;
+  let metered = true;
+  let any = false;
+  for (const rec of history) {
+    if (!rec.rewarm) continue;
+    any = true;
+    usd += rec.rewarm.usd;
+    if (!rec.rewarm.metered) metered = false;
+  }
+  return any ? { usd, metered } : null;
+}
+
+/**
  * Reconstruct turn history from the session transcript. This is the source of
  * truth: real user/assistant messages always persist in the session file, so
  * history survives /reload and is recovered for pre-existing sessions.
@@ -234,9 +314,21 @@ export function resolveWithinCwd(cwd: string, rel: string): string | null {
  * A "turn" spans from a user message to the last message before the next user
  * message (the agent's final activity). durationMs is that span; waitBeforeMs
  * is the idle gap between the previous turn's settle and this user message.
+ * Each turn also captures its first assistant response's usage so rewarm cost
+ * can be attached (see rewarmForTurn). `fallbackRates` (the current model's
+ * cost rates) is only used when the provider reported no cache-write cost.
  */
-export function reconstructHistory(entries: readonly unknown[]): TurnRecord[] {
-  type MsgEntry = { type: string; timestamp?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+export function reconstructHistory(entries: readonly unknown[], fallbackRates?: CacheCostRates | null): TurnRecord[] {
+  type MsgEntry = {
+    type: string;
+    timestamp?: string;
+    message?: {
+      role?: string;
+      model?: string;
+      content?: Array<{ type?: string; text?: string }>;
+      usage?: { input?: number; cacheWrite?: number; cost?: { cacheWrite?: number } };
+    };
+  };
   const msgs = (entries as MsgEntry[]).filter(
     (e) => e.type === "message" && e.message != null && typeof e.timestamp === "string",
   );
@@ -259,21 +351,37 @@ export function reconstructHistory(entries: readonly unknown[]): TurnRecord[] {
       .join(" ")
       .trim();
 
-    // Find the last message before the next user message.
+    // Find the last message before the next user message, capturing the first
+    // assistant response's usage on the way (the response that would have
+    // re-established an expired cache). toolResult messages also carry usage
+    // for nested LLM work — they are deliberately skipped.
     let j = i + 1;
     let lastActivityMs = userMs;
+    let firstAssistant: { input: number; cacheWrite: number; cacheWriteCost: number; model?: string } | null = null;
     while (j < msgs.length && msgs[j]!.message?.role !== "user") {
+      const m = msgs[j]!.message!;
       const t = Date.parse(msgs[j]!.timestamp!);
       if (!Number.isNaN(t)) lastActivityMs = t;
+      if (firstAssistant === null && m.role === "assistant" && m.usage) {
+        firstAssistant = {
+          input: m.usage.input ?? 0,
+          cacheWrite: m.usage.cacheWrite ?? 0,
+          cacheWriteCost: m.usage.cost?.cacheWrite ?? 0,
+          model: m.model,
+        };
+      }
       j++;
     }
 
     if (text.length > 0 && !Number.isNaN(userMs)) {
+      const waitBeforeMs = lastSettleMs !== null ? Math.max(0, userMs - lastSettleMs) : 0;
+      const rewarm = rewarmForTurn(firstAssistant, waitBeforeMs, fallbackRates ?? null);
       turns.push({
         promptText: truncatePrompt(text),
         durationMs: Math.max(0, lastActivityMs - userMs),
-        waitBeforeMs: lastSettleMs !== null ? Math.max(0, userMs - lastSettleMs) : 0,
+        waitBeforeMs,
         at: userMs,
+        ...(rewarm ? { rewarm } : {}),
       });
       lastSettleMs = lastActivityMs;
     }
@@ -326,7 +434,14 @@ export function renderHistoryMarkdown(history: TurnRecord[], meta: HistoryFileMe
         lines.push("");
       }
       const dur = formatDuration(rec.durationMs).padStart(5);
-      lines.push(`${dur}  ↑  ${rec.promptText}   [${formatTimestamp(rec.at)}]`);
+      const badge = rec.rewarm ? ` · ${formatRewarmBadge(rec.rewarm)}` : "";
+      lines.push(`${dur}  ↑  ${rec.promptText}${badge}   [${formatTimestamp(rec.at)}]`);
+      lines.push("");
+    }
+    const total = totalRewarmCost(history);
+    if (total) {
+      const cost = total.metered ? formatEstimatedCost(total.usd) : `~${formatEstimatedCost(total.usd)} (est.)`;
+      lines.push("---", "", `**Session rewarm total:** ${cost}`);
       lines.push("");
     }
   }
@@ -338,13 +453,16 @@ function csvEscape(value: string): string {
 }
 
 export function renderHistoryCsv(history: TurnRecord[]): string {
-  const header = "timestamp,duration_ms,duration,wait_before_ms,prompt";
+  const header = "timestamp,duration_ms,duration,wait_before_ms,rewarm_tokens,rewarm_usd,rewarm_metered,prompt";
   const rows = history.map((rec) =>
     [
       formatTimestamp(rec.at),
       String(rec.durationMs),
       formatDuration(rec.durationMs),
       String(rec.waitBeforeMs),
+      rec.rewarm ? String(rec.rewarm.tokens) : "",
+      rec.rewarm ? rec.rewarm.usd.toFixed(4) : "",
+      rec.rewarm ? String(rec.rewarm.metered) : "",
       csvEscape(rec.promptText),
     ].join(","),
   );
@@ -356,6 +474,10 @@ export function renderHistoryJson(history: TurnRecord[], meta: HistoryFileMeta):
     date: meta.date.toISOString(),
     session: meta.sessionName ?? null,
     cwd: meta.cwd,
+    rewarmTotal: (() => {
+      const total = totalRewarmCost(history);
+      return total ? { usd: Number(total.usd.toFixed(4)), metered: total.metered } : null;
+    })(),
     turns: history.map((rec) => ({
       at: new Date(rec.at).toISOString(),
       timestamp: formatTimestamp(rec.at),
@@ -363,6 +485,14 @@ export function renderHistoryJson(history: TurnRecord[], meta: HistoryFileMeta):
       duration: formatDuration(rec.durationMs),
       waitBeforeMs: rec.waitBeforeMs,
       prompt: rec.promptText,
+      rewarm: rec.rewarm
+        ? {
+            tokens: rec.rewarm.tokens,
+            usd: Number(rec.rewarm.usd.toFixed(4)),
+            metered: rec.rewarm.metered,
+            model: rec.rewarm.model ?? null,
+          }
+        : null,
     })),
   };
   return `${JSON.stringify(payload, null, 2)}\n`;
@@ -388,6 +518,8 @@ export class TimerHistoryComponent {
   private writeSelected: 0 | 1 | 2 = 1;
   /** Index into EXPORT_FORMATS for the currently selected export format. */
   private writeFormat: 0 | 1 | 2 = 0;
+  /** Session-wide rewarm total, or null when no turn re-warmed the cache. */
+  private readonly rewarmTotal: { usd: number; metered: boolean } | null;
 
   constructor(
     history: TurnRecord[],
@@ -398,6 +530,7 @@ export class TimerHistoryComponent {
     private readonly doneFn: (result: OverlayResult) => void,
   ) {
     this.rows = TimerHistoryComponent.buildRows(history, liveEntry);
+    this.rewarmTotal = totalRewarmCost(history);
     if (liveEntry) {
       this.liveTimer = setInterval(() => tui.requestRender(), 1000);
     }
@@ -483,12 +616,14 @@ export class TimerHistoryComponent {
     if (row.kind === "turn") {
       const dur = formatDuration(row.rec.durationMs).padStart(5);
       const arrowWidth = 5; // "  ↑  "
-      const labelMaxWidth = contentWidth - 5 - arrowWidth;
-      const label = truncateToWidth(row.rec.promptText, labelMaxWidth);
+      const badge = row.rec.rewarm ? ` · ${formatRewarmBadge(row.rec.rewarm)}` : "";
+      const labelMaxWidth = contentWidth - 5 - arrowWidth - visibleWidth(badge);
+      const label = truncateToWidth(row.rec.promptText, Math.max(0, labelMaxWidth));
       const durStr = selected ? t.fg("accent", dur) : t.fg("dim", dur);
       const arrow = selected ? t.fg("accent", "  ↑  ") : t.fg("dim", "  ↑  ");
       const labelStr = selected ? label : t.fg("dim", label);
-      return prefix + fillToWidth(durStr + arrow + labelStr, contentWidth);
+      const badgeStr = badge ? (selected ? t.fg("accent", badge) : t.fg("warning", badge)) : "";
+      return prefix + fillToWidth(durStr + arrow + labelStr + badgeStr, contentWidth);
     }
 
     // live (in-progress turn)
@@ -527,7 +662,9 @@ export class TimerHistoryComponent {
         content.push(fillToWidth(t.fg("dim", "   (no history yet)"), innerWidth));
         content.push(fillToWidth(t.fg("dim", "   Send a prompt to start tracking timing."), innerWidth));
       } else {
-        const listRows = CONTENT_ROWS - content.length;
+        // The box is a fixed CONTENT_ROWS tall; when a rewarm total exists it
+        // claims the bottom two rows (separator + summary), shrinking the list.
+        const listRows = CONTENT_ROWS - content.length - (this.rewarmTotal ? 2 : 0);
         this.selected = Math.max(0, Math.min(this.selected, this.rows.length - 1));
         const scrollStart = Math.max(0, this.selected - listRows + 1);
         const visible = this.rows.slice(scrollStart, scrollStart + listRows);
@@ -535,6 +672,14 @@ export class TimerHistoryComponent {
           const isActive = scrollStart + i === this.selected;
           content.push(fillToWidth(this.renderRow(visible[i]!, isActive, innerWidth), innerWidth));
         }
+      }
+      if (this.rewarmTotal) {
+        while (content.length < CONTENT_ROWS - 2) content.push(" ".repeat(innerWidth));
+        content.push(fillToWidth(t.fg("border", `   ${"─".repeat(Math.max(0, innerWidth - 6))}`), innerWidth));
+        const cost = this.rewarmTotal.metered
+          ? formatEstimatedCost(this.rewarmTotal.usd)
+          : `~${formatEstimatedCost(this.rewarmTotal.usd)} (est.)`;
+        content.push(fillToWidth(t.fg("warning", `   Session rewarm total: ${cost}`), innerWidth));
       }
     } else {
       content.push(fillToWidth(t.fg("dim", "   Save the timer history as:"), innerWidth));
@@ -664,6 +809,12 @@ export function buildDefaultPath(sessionName: string | undefined, format: Export
   return nodePath.join(".scratch", `timer-${date}-${time}${slug}.${ext}`);
 }
 
+/** The current model's per-million-token rates, or null when it reports none. */
+function modelCostRates(ctx: ExtensionContext): CacheCostRates | null {
+  const cost = ctx.model?.cost;
+  return cost ? { input: cost.input, cacheRead: cost.cacheRead, cacheWrite: cost.cacheWrite } : null;
+}
+
 async function writeHistoryFile(
   filePath: string,
   cwd: string,
@@ -770,7 +921,7 @@ export default function promptTimer(pi: ExtensionAPI) {
 
     // Reconstruct completed turns from the in-memory session transcript.
     // (getEntries() is synchronous/in-memory — no disk read, no LLM-context cost.)
-    const allTurns = reconstructHistory(ctx.sessionManager.getEntries());
+    const allTurns = reconstructHistory(ctx.sessionManager.getEntries(), modelCostRates(ctx));
     // Drop the in-progress turn (shown separately as the live row).
     const history = liveEntry
       ? allTurns.filter((tn) => tn.at !== liveEntry.startedAt)
@@ -850,9 +1001,7 @@ export default function promptTimer(pi: ExtensionAPI) {
     lastProviderResponseAt = Date.now();
     const usage = event.message.usage;
     lastCachedTokens = (usage?.cacheRead ?? 0) + (usage?.cacheWrite ?? 0);
-    lastCacheCostRates = ctx.model?.cost
-      ? { input: ctx.model.cost.input, cacheRead: ctx.model.cost.cacheRead, cacheWrite: ctx.model.cost.cacheWrite }
-      : null;
+    lastCacheCostRates = modelCostRates(ctx);
   });
 
   // Blocking user-facing prompt opened/closed (ask_user_question, confirm,
@@ -899,7 +1048,7 @@ export default function promptTimer(pi: ExtensionAPI) {
     // Restore the cache anchor from the transcript so /reload (which preserves
     // context, hence the live prompt cache) keeps the cache-TTL clock ticking.
     // A genuinely new session has no turns, so the footer stays empty (—).
-    const turns = reconstructHistory(ctx.sessionManager.getEntries());
+    const turns = reconstructHistory(ctx.sessionManager.getEntries(), modelCostRates(ctx));
     const lastTurn = turns[turns.length - 1];
     if (lastTurn) {
       lastProviderResponseAt = lastTurn.at + lastTurn.durationMs;
@@ -908,9 +1057,7 @@ export default function promptTimer(pi: ExtensionAPI) {
     const lastUsage = findLastAssistantUsage(ctx.sessionManager.getEntries());
     if (lastUsage) {
       lastCachedTokens = lastUsage.cacheRead + lastUsage.cacheWrite;
-      lastCacheCostRates = ctx.model?.cost
-        ? { input: ctx.model.cost.input, cacheRead: ctx.model.cost.cacheRead, cacheWrite: ctx.model.cost.cacheWrite }
-        : null;
+      lastCacheCostRates = modelCostRates(ctx);
     }
 
     if (!ctx.hasUI) return;
