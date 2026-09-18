@@ -101,6 +101,14 @@ one row per turn (the agent's response time and a preview of your prompt). Idle 
 5-minute cache TTL). An in-progress turn appears as a live row at the bottom. An empty session shows a short hint to
 send a prompt to start tracking.
 
+A turn whose prompt arrived after the cache TTL expired carries a `rewarm` badge showing what re-establishing the
+cache cost: the metered cache-write charge when the provider bills one (`rewarm $0.09`), or an estimate from token
+counts and the model's rates when it doesn't (`rewarm ~$0.09 (est.)`). A `Session rewarm total` row is pinned to the
+bottom of the box when any turn re-warmed the cache; if any contributing turn was estimated, the total is marked
+`(est.)` too. The session's first prompt is never flagged — a cold start is unavoidable, not a rewarm. Costs come
+from the persisted transcript (per-message usage and billed cost), so they survive `/reload` and stay correct across
+mid-session model switches.
+
 When the overlay is open:
 
 - `↑` / `↓` or `j` / `k` — move through history
@@ -120,7 +128,8 @@ Switch to the **Write to file** tab (`→` or `tab`) and use `↑` / `↓` to mo
   shows the full resolved path so the destination is unambiguous.
 
 Each format records every turn's timestamp, response duration, and prompt preview, with `waiting` markers for idle
-gaps (Markdown), a dedicated column (CSV, comma/quote/newline-escaped), or structured fields (JSON). The `.scratch/`
+gaps (Markdown), a dedicated column (CSV, comma/quote/newline-escaped), or structured fields (JSON). Rewarm data is
+included per turn in all three formats, and the session rewarm total appears in Markdown and JSON. The `.scratch/`
 directory is created automatically if it does not exist.
 
 ### Cache-TTL clock during questions

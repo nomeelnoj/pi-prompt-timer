@@ -3,6 +3,21 @@
 All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Rewarm cost in history**: a turn whose prompt arrived after the 5-minute cache TTL expired now carries a
+  `rewarm` badge in the `/timer` history overlay, showing what re-establishing the cache cost. Uses the metered
+  cache-write charge reported by the provider when available (`rewarm $0.09`), falling back to an estimate from
+  token counts and the model's rates (`rewarm ~$0.09 (est.)`) for providers with implicit caching or no reported
+  cache-write cost. A `Session rewarm total` row is pinned to the bottom of the overlay, marked `(est.)` if any
+  contributing turn was estimated. The session's first prompt is never flagged — a cold start is unavoidable, not
+  a rewarm. Costs are reconstructed from the persisted transcript (per-message usage and billed cost), so they
+  survive `/reload` and remain correct across mid-session model switches.
+- Exports: Markdown, CSV, and JSON history files now include per-turn rewarm fields (tokens, cost, metered flag);
+  Markdown and JSON also record the session rewarm total.
+
 ## [0.2.0] - 2026-09-16
 
 ### Added
