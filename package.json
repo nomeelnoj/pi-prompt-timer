@@ -1,6 +1,6 @@
 {
   "name": "@nomeelnoj/pi-prompt-timer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Live prompt-timing extension for pi coding agent — shows elapsed thinking time and an idle timer that warns at the 5-minute cache TTL.",
   "author": "Jon Leemon",
   "type": "module",
