@@ -77,7 +77,7 @@ const FORMAT_EXTENSIONS: Record<ExportFormat, string> = { markdown: "md", csv: "
 // Data model
 // ---------------------------------------------------------------------------
 
-type TurnRecord = {
+export type TurnRecord = {
   promptText: string;   // first line of prompt, truncated to PROMPT_PREVIEW
   durationMs: number;   // time from user pressing Enter → agent_settled
   waitBeforeMs: number; // idle gap between previous agent_settled and this Enter
@@ -227,14 +227,21 @@ export function formatRewarmBadge(rewarm: RewarmRecord): string {
     : `rewarm ~${formatEstimatedCost(rewarm.usd)} (est.)`;
 }
 
+/**
+ * First-line prompt preview. Control characters are stripped here — at the
+ * single choke point for every prompt preview — so stored or pasted prompt
+ * text cannot inject terminal escape sequences into overlay rows, the live
+ * row, or exported history files.
+ */
 export function truncatePrompt(text: string): string {
-  const first = text.split("\n")[0] ?? text;
+  const first = stripControlChars(text.split("\n")[0] ?? text);
   return first.length <= PROMPT_PREVIEW ? first : first.slice(0, PROMPT_PREVIEW - 1) + "…";
 }
 
 /**
- * Strip C0/C1 control characters so interpolated values (session name, cwd)
- * cannot inject terminal escape sequences when written to the title bar.
+ * Strip C0/C1 control characters so interpolated values (session name, cwd,
+ * prompt previews) cannot inject terminal escape sequences into the title
+ * bar, overlay rows, or exported files.
  */
 export function stripControlChars(text: string): string {
   // eslint-disable-next-line no-control-regex
@@ -318,6 +325,11 @@ export function totalRewarmCost(history: readonly TurnRecord[]): { usd: number; 
  * can be attached (see rewarmForTurn). `fallbackRates` (the current model's
  * cost rates) is only used when the provider reported no cache-write cost.
  */
+/** Coerce an untrusted transcript value to a finite number (non-numeric → 0). */
+function asFiniteNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 export function reconstructHistory(entries: readonly unknown[], fallbackRates?: CacheCostRates | null): TurnRecord[] {
   type MsgEntry = {
     type: string;
@@ -325,8 +337,8 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
     message?: {
       role?: string;
       model?: string;
-      content?: Array<{ type?: string; text?: string }>;
-      usage?: { input?: number; cacheWrite?: number; cost?: { cacheWrite?: number } };
+      content?: string | Array<{ type?: string; text?: string }>;
+      usage?: { input?: unknown; cacheWrite?: unknown; cost?: { cacheWrite?: unknown } };
     };
   };
   const msgs = (entries as MsgEntry[]).filter(
@@ -345,7 +357,16 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
     }
 
     const userMs = Date.parse(e.timestamp!);
-    const text = (e.message.content ?? [])
+    // pi's message model also permits string content (older, headless, or
+    // RPC-authored transcripts and /import) — normalize before assuming an
+    // array of content blocks, or those sessions throw on every load.
+    const rawContent = e.message.content;
+    const blocks: Array<{ type?: string; text?: string }> = Array.isArray(rawContent)
+      ? rawContent
+      : typeof rawContent === "string"
+        ? [{ type: "text", text: rawContent }]
+        : [];
+    const text = blocks
       .filter((c) => c.type === "text" && typeof c.text === "string")
       .map((c) => c.text as string)
       .join(" ")
@@ -363,10 +384,13 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
       const t = Date.parse(msgs[j]!.timestamp!);
       if (!Number.isNaN(t)) lastActivityMs = t;
       if (firstAssistant === null && m.role === "assistant" && m.usage) {
+        // Transcripts are trusted-local but not type-checked (imported/shared
+        // sessions), so coerce at the boundary: a string-typed cost would
+        // otherwise pass a > 0 check by coercion and throw later at toFixed.
         firstAssistant = {
-          input: m.usage.input ?? 0,
-          cacheWrite: m.usage.cacheWrite ?? 0,
-          cacheWriteCost: m.usage.cost?.cacheWrite ?? 0,
+          input: asFiniteNumber(m.usage.input),
+          cacheWrite: asFiniteNumber(m.usage.cacheWrite),
+          cacheWriteCost: asFiniteNumber(m.usage.cost?.cacheWrite),
           model: m.model,
         };
       }
@@ -403,15 +427,31 @@ function fillToWidth(s: string, w: number): string {
  * mirroring how lastProviderResponseAt/lastRunMs are restored from history.
  */
 export function findLastAssistantUsage(entries: readonly unknown[]): { cacheRead: number; cacheWrite: number } | null {
-  type UsageEntry = { type: string; message?: { role?: string; usage?: { cacheRead?: number; cacheWrite?: number } } };
+  type UsageEntry = { type: string; message?: { role?: string; usage?: { cacheRead?: unknown; cacheWrite?: unknown } } };
   const msgs = entries as UsageEntry[];
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (m?.type === "message" && m.message?.role === "assistant" && m.message.usage) {
-      return { cacheRead: m.message.usage.cacheRead ?? 0, cacheWrite: m.message.usage.cacheWrite ?? 0 };
+      return { cacheRead: asFiniteNumber(m.message.usage.cacheRead), cacheWrite: asFiniteNumber(m.message.usage.cacheWrite) };
     }
   }
   return null;
+}
+
+/**
+ * Drop the in-progress turn from reconstructed history when a live entry is
+ * shown separately. The pending prompt is always the transcript's last turn,
+ * but its persisted timestamp is a separate Date.now() taken after input
+ * hooks and image normalization run, so exact-equality matching against the
+ * input-event clock silently fails on any ≥1 ms drift and the turn renders
+ * twice. Dropping the last turn whenever it began at or after the live start
+ * tolerates that drift, and keeps older turns untouched when an input event
+ * never became a transcript turn (e.g. a short-circuited input handler).
+ */
+export function dropInProgressTurn(turns: TurnRecord[], liveStartedAt: number | null): TurnRecord[] {
+  if (liveStartedAt === null || turns.length === 0) return turns;
+  const last = turns[turns.length - 1]!;
+  return last.at >= liveStartedAt ? turns.slice(0, -1) : turns;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,8 +488,17 @@ export function renderHistoryMarkdown(history: TurnRecord[], meta: HistoryFileMe
   return lines.join("\n");
 }
 
+/**
+ * Escape a CSV cell: quote values containing a comma, quote, or line break
+ * (including \r, which survives first-line truncation), and neutralize
+ * spreadsheet formula injection by apostrophe-prefixing values that begin
+ * with a formula metacharacter — a pasted prompt whose first line starts
+ * with =, +, -, @, tab, or CR must stay inert when the CSV is opened in
+ * Excel/Sheets.
+ */
 function csvEscape(value: string): string {
-  return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+  const guarded = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  return /[",\n\r]/.test(guarded) ? `"${guarded.replace(/"/g, '""')}"` : guarded;
 }
 
 export function renderHistoryCsv(history: TurnRecord[]): string {
@@ -815,7 +864,7 @@ function modelCostRates(ctx: ExtensionContext): CacheCostRates | null {
   return cost ? { input: cost.input, cacheRead: cost.cacheRead, cacheWrite: cost.cacheWrite } : null;
 }
 
-async function writeHistoryFile(
+export async function writeHistoryFile(
   filePath: string,
   cwd: string,
   history: TurnRecord[],
@@ -826,7 +875,17 @@ async function writeHistoryFile(
   // path), so resolve it against cwd; the project dir contains the output.
   const resolved = nodePath.resolve(cwd, filePath);
   const body = renderHistoryContent(format, history, { date: new Date(), sessionName, cwd });
-  await nodeFs.promises.mkdir(nodePath.dirname(resolved), { recursive: true });
+  const parent = nodePath.dirname(resolved);
+  await nodeFs.promises.mkdir(parent, { recursive: true });
+  // Lexical containment is not enough on its own: a symlinked component (a
+  // hostile repo shipping .scratch as a symlink, say) would redirect the
+  // write outside the project, and mkdir/writeFile follow symlinks. Re-verify
+  // containment on real paths before writing.
+  const cwdReal = await nodeFs.promises.realpath(cwd);
+  const parentReal = await nodeFs.promises.realpath(parent);
+  if (parentReal !== cwdReal && !parentReal.startsWith(cwdReal + nodePath.sep)) {
+    throw new Error("Export path escapes the project directory through a symlink");
+  }
   await nodeFs.promises.writeFile(resolved, body, "utf8");
 }
 
@@ -923,9 +982,7 @@ export default function promptTimer(pi: ExtensionAPI) {
     // (getEntries() is synchronous/in-memory — no disk read, no LLM-context cost.)
     const allTurns = reconstructHistory(ctx.sessionManager.getEntries(), modelCostRates(ctx));
     // Drop the in-progress turn (shown separately as the live row).
-    const history = liveEntry
-      ? allTurns.filter((tn) => tn.at !== liveEntry.startedAt)
-      : allTurns;
+    const history = dropInProgressTurn(allTurns, liveEntry?.startedAt ?? null);
 
     const sessionName = pi.getSessionName() ?? undefined;
 
@@ -947,12 +1004,7 @@ export default function promptTimer(pi: ExtensionAPI) {
 
     const path = result.target === "auto" ? buildDefaultPath(sessionName, result.format) : null;
     if (path !== null) {
-      try {
-        await writeHistoryFile(path, ctx.cwd, history, sessionName, result.format);
-        ctx.ui.notify(`Saved → ${nodePath.resolve(ctx.cwd, path)}`, "info");
-      } catch (err) {
-        ctx.ui.notify(`Write failed: ${(err as Error).message}`, "error");
-      }
+      await saveHistoryWithConfirm(ctx, path, history, sessionName, result.format);
       return;
     }
 
@@ -961,7 +1013,9 @@ export default function promptTimer(pi: ExtensionAPI) {
       "Save timer history — path relative to the project directory",
       suggested,
     );
-    const rel = input?.trim();
+    // Strip control characters at ingestion so a pasted path cannot inject
+    // escape sequences into the confirmation/notify strings that echo it.
+    const rel = stripControlChars(input?.trim() ?? "");
     if (!rel) return;
     // Confine the custom path to inside cwd: no absolute paths, no `..` escapes.
     const resolved = resolveWithinCwd(ctx.cwd, rel);
@@ -972,9 +1026,34 @@ export default function promptTimer(pi: ExtensionAPI) {
       );
       return;
     }
+    await saveHistoryWithConfirm(ctx, rel, history, sessionName, result.format);
+  }
+
+  /**
+   * Write a history export, confirming first when the target already exists:
+   * the custom path can name any in-project file, and two auto-path exports
+   * within the same minute collide. The writer itself re-verifies real-path
+   * containment against symlink escapes.
+   */
+  async function saveHistoryWithConfirm(
+    ctx: ExtensionContext,
+    rel: string,
+    history: TurnRecord[],
+    sessionName: string | undefined,
+    format: ExportFormat,
+  ): Promise<void> {
+    const target = nodePath.resolve(ctx.cwd, rel);
+    const exists = await nodeFs.promises.stat(target).then(
+      () => true,
+      () => false,
+    );
+    if (exists) {
+      const ok = await ctx.ui.confirm("Overwrite existing file?", `${rel} already exists.`);
+      if (!ok) return;
+    }
     try {
-      await writeHistoryFile(rel, ctx.cwd, history, sessionName, result.format);
-      ctx.ui.notify(`Saved → ${resolved}`, "info");
+      await writeHistoryFile(rel, ctx.cwd, history, sessionName, format);
+      ctx.ui.notify(`Saved → ${target}`, "info");
     } catch (err) {
       ctx.ui.notify(`Write failed: ${(err as Error).message}`, "error");
     }
