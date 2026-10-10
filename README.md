@@ -148,6 +148,26 @@ traffic — idling at the prompt, a long-running tool, or waiting for a human an
 therefore anchors its countdown to the last completed provider response rather than to any single "idle" event. The
 default TTL is 5 minutes (`CACHE_TTL_MS`); adjust the constant if your provider tier uses a different window.
 
+## Where pricing data comes from
+
+Every dollar figure this package shows is derived from data Pi already has — the extension never calls an external
+pricing API.
+
+- **Metered costs** come from the persisted session transcript. Each assistant message Pi writes carries a `usage`
+  record with the provider-priced `usage.cost.cacheWrite`, so a `rewarm $0.09` badge is the actual billed cache-write
+  charge for the response that re-established the cache. Transcript-sourced figures survive `/reload` and stay priced
+  by the model that produced each message, even across mid-session model switches.
+- **Estimates** (marked with `~` or `(est.)`) come from `ctx.model.cost` — the current model's per-million-token
+  input, cache-read, and cache-write rates as reported by Pi's model registry. The `~$0.08 to rebuild` footer figure
+  multiplies the cached tokens on the last response by the gap between the cache-write and cache-read rates (falling
+  back to the plain input rate when the model has no separate cache-write fee); rewarm estimates use the same rates
+  against the re-establishing response's token counts when the provider reports no cache-write cost
+  (OpenAI/Gemini-style implicit caching, or missing cost data).
+
+When a model reports all-zero rates — local or unknown models — the package shows nothing rather than a misleading
+`$0.00`. And because estimates inherit whatever rates Pi's registry holds, a provider or tier whose pricing differs
+from the registry shifts the estimates; the metered transcript figures remain authoritative.
+
 ## Support and contributing
 
 - Use the [bug report form](https://github.com/nomeelnoj/pi-prompt-timer/issues/new?template=bug_report.yml) for
