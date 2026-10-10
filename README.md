@@ -124,11 +124,13 @@ Switch to the **Write to file** tab (`→` or `tab`) and use `↑` / `↓` to mo
 - **Auto path** — `.scratch/timer-<date>[-session].<ext>`, relative to the current working directory; press `enter`
   to write immediately in the selected format.
 - **Choose a relative path** — opens an input pre-filled with the auto path (matching extension). The destination
-  must be **relative to the project directory**; absolute paths and `../` escapes are rejected. The save confirmation
-  shows the full resolved path so the destination is unambiguous.
+  must be **relative to the project directory**; absolute paths, `../` escapes, and symlink escapes are rejected,
+  and overwriting an existing file asks for confirmation first. The save confirmation shows the full resolved path
+  so the destination is unambiguous.
 
 Each format records every turn's timestamp, response duration, and prompt preview, with `waiting` markers for idle
-gaps (Markdown), a dedicated column (CSV, comma/quote/newline-escaped), or structured fields (JSON). Rewarm data is
+gaps (Markdown), a dedicated column (CSV, comma/quote/newline-escaped and guarded against spreadsheet formula
+injection), or structured fields (JSON). Rewarm data is
 included per turn in all three formats, and the session rewarm total appears in Markdown and JSON. The `.scratch/`
 directory is created automatically if it does not exist.
 

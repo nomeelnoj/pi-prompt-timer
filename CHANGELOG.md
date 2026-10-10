@@ -3,6 +3,25 @@
 All notable changes are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Security
+
+- Prompt previews (history overlay rows, live row, and Markdown/CSV/JSON exports) now have C0/C1 control
+  characters stripped, so stored or pasted prompt text cannot inject terminal escape sequences. CSV export cells
+  beginning with a spreadsheet formula metacharacter (`=`, `+`, `-`, `@`, tab, CR) are apostrophe-prefixed, and
+  `\r` now triggers cell quoting. Custom export paths have control characters stripped before use.
+- History export re-verifies the destination's real path after resolving symlinks, so a symlinked `.scratch/`
+  (or any other path component) can no longer redirect the write outside the project directory. Overwriting an
+  existing file now asks for confirmation first.
+
+### Fixed
+
+- History overlay: the in-progress turn no longer renders twice (once as a regular row and again as the live
+  row) when the pending prompt's persisted timestamp drifted from the input-event clock.
+- Transcript parsing tolerates string-typed message content (older, headless, RPC-authored, or `/import`ed
+  sessions) and non-numeric usage/cost fields instead of throwing on session start.
+
 ## [0.3.0] - 2026-09-18
 
 ### Added
