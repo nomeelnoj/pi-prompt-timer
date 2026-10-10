@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, readFile, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createJiti } from "jiti";
@@ -27,6 +30,8 @@ const {
   rewarmForTurn,
   totalRewarmCost,
   formatRewarmBadge,
+  dropInProgressTurn,
+  writeHistoryFile,
   TimerHistoryComponent,
 } = await jiti.import(extensionPath);
 
@@ -455,4 +460,86 @@ test("resolveWithinCwd confines custom paths to cwd", () => {
   assert.equal(resolveWithinCwd(cwd, "../../etc/passwd"), null);
   assert.equal(resolveWithinCwd(cwd, ""), null);
   assert.equal(resolveWithinCwd(cwd, "."), null);
+});
+
+test("truncatePrompt strips control characters so escape sequences cannot reach the overlay", () => {
+  // An OSC 52 (clipboard-write) payload: the ESC/CSI bytes are removed and
+  // only inert printable residue remains.
+  const poisoned = "run this \x1b]52;c;AAAA\x07 please";
+  const out = truncatePrompt(poisoned);
+  assert.equal(out, "run this ]52;c;AAAA please");
+  assert.ok(!/[\x00-\x1f\x7f-\x9f]/.test(out));
+});
+
+test("renderHistoryCsv neutralizes spreadsheet formula injection and quotes CR", () => {
+  const rec = (promptText) => ({ promptText, durationMs: 1_000, waitBeforeMs: 0, at: 1_700_000_000_000 });
+  // Formula metacharacters get an apostrophe prefix (the embedded quotes and
+  // comma additionally force quoting, hence the leading '"').
+  assert.ok(renderHistoryCsv([rec('=HYPERLINK("https://example.invalid","x")')]).includes(`"'=HYPERLINK`));
+  assert.ok(renderHistoryCsv([rec("+1")]).includes("'+1"));
+  assert.ok(renderHistoryCsv([rec("-2")]).includes("'-2"));
+  assert.ok(renderHistoryCsv([rec("@x")]).includes("'@x"));
+  assert.ok(renderHistoryCsv([rec("\t=cmd")]).includes("'\t=cmd"));
+  // A bare CR is quoted so it cannot corrupt rows in spreadsheet parsers.
+  assert.ok(renderHistoryCsv([rec("first line\r")]).includes('"first line\r"'));
+});
+
+test("reconstructHistory tolerates string content and non-numeric usage fields", () => {
+  const base = Date.parse("2026-01-01T00:00:00.000Z");
+  const iso = (ms) => new Date(ms).toISOString();
+  // String message content occurs in older, headless, RPC-authored, or
+  // /import'ed transcripts; string-typed cost fields in shared transcripts.
+  const entries = [
+    { type: "message", timestamp: iso(base), message: { role: "user", content: "plain string prompt" } },
+    { type: "message", timestamp: iso(base + 1_000), message: { role: "assistant", content: "done", usage: { input: 10, cacheWrite: 0 } } },
+    { type: "message", timestamp: iso(base + 6 * 60_000), message: { role: "user", content: "second" } },
+    {
+      type: "message",
+      timestamp: iso(base + 6 * 60_000 + 1_000),
+      message: { role: "assistant", content: "done", usage: { input: 1_000, cacheWrite: 500, cost: { cacheWrite: "0.09" } } },
+    },
+  ];
+  const rates = { input: 3, cacheRead: 0.3, cacheWrite: 3.75 };
+  const turns = reconstructHistory(entries, rates);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].promptText, "plain string prompt");
+  // "0.09" coerced to 0 at the boundary, so the turn takes the estimate path
+  // instead of crashing at toFixed in the badge/exports.
+  assert.equal(turns[1].rewarm?.metered, false);
+  assert.doesNotThrow(() => formatRewarmBadge(turns[1].rewarm));
+});
+
+test("dropInProgressTurn drops the transcript-tail pending turn despite clock drift", () => {
+  const turns = [
+    { promptText: "a", durationMs: 100, waitBeforeMs: 0, at: 1_000 },
+    { promptText: "b", durationMs: 0, waitBeforeMs: 0, at: 2_000 },
+  ];
+  // The persisted user message landed 3 ms after the input event (hooks/image
+  // normalization): exact-equality matching would keep the turn and render it
+  // twice; positional matching drops it.
+  assert.deepEqual(dropInProgressTurn(turns, 1_997).map((t) => t.promptText), ["a"]);
+  // No pending turn was persisted (a short-circuited handler): nothing drops.
+  assert.equal(dropInProgressTurn(turns, 3_000).length, 2);
+  assert.equal(dropInProgressTurn(turns, null).length, 2);
+  assert.equal(dropInProgressTurn([], 1_000).length, 0);
+});
+
+test("writeHistoryFile refuses to write through a symlinked directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prompt-timer-"));
+  const project = join(root, "project");
+  const outside = join(root, "outside");
+  await mkdir(project);
+  await mkdir(outside);
+  await symlink(outside, join(project, ".scratch"));
+  await assert.rejects(
+    writeHistoryFile(".scratch/history.md", project, [], undefined, "markdown"),
+    /symlink/,
+  );
+});
+
+test("writeHistoryFile writes inside the project on the normal path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "prompt-timer-"));
+  await writeHistoryFile(".scratch/history.md", root, [], undefined, "markdown");
+  const body = await readFile(join(root, ".scratch", "history.md"), "utf8");
+  assert.match(body, /# Timer History/);
 });
