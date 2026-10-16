@@ -36,7 +36,14 @@
  *   response (last assistant message end), not to agent-idle state.
  */
 
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionContext,
+  convertToLlm,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type Theme,
+  type ToolInfo,
+} from "@earendil-works/pi-coding-agent";
 import {
   Key,
   matchesKey,
@@ -53,6 +60,12 @@ import * as nodePath from "node:path";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_WARN_MS = 4 * 60 * 1000;
+const CACHE_REWARM_LEAD_MS = 75 * 1000;
+const DEFAULT_REWARM_DURATION_MS = 60 * 60 * 1000;
+const MAX_REWARM_DURATION_MS = 24 * 60 * 60 * 1000;
+const REWARM_CONFIG_FILE = ".pi/prompt-timer.json";
+const TIMER_WIDGET_KEY = "prompt-timer";
+const REWARM_PROMPT = ".";
 
 /**
  * Mirror the cache-TTL countdown into the terminal title bar while a blocking
@@ -181,6 +194,72 @@ export function cacheCountdown(sinceMs: number, now: number): { text: string; le
     return { text: `⌛ ${dur}  · cache TTL expires in ${rem}`, level };
   }
   return { text: `⌛ ${dur}`, level };
+}
+
+/** Parse a cache-rewarm duration such as "1h" or "15m"; zero disables it. */
+export function parseRewarmDuration(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "off") return 0;
+  const match = /^(\d+)(m|h)$/.exec(normalized);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const durationMs = amount * (match[2] === "h" ? 60 * 60 * 1000 : 60 * 1000);
+  return Number.isSafeInteger(durationMs) && durationMs >= 60_000 && durationMs <= MAX_REWARM_DURATION_MS
+    ? durationMs
+    : null;
+}
+
+/** Read the persisted duration, defaulting to one hour when unset. */
+export function parseRewarmConfig(value: unknown): number {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Config must be a JSON object");
+  }
+  const duration = (value as { rewarmDuration?: unknown }).rewarmDuration;
+  if (duration === undefined) return DEFAULT_REWARM_DURATION_MS;
+  const parsed = parseRewarmDuration(duration);
+  if (parsed === null) throw new Error('"rewarmDuration" must be "off" or a duration from 1m to 24h');
+  return parsed;
+}
+
+export async function rewarmProviderCache(
+  ctx: ExtensionContext,
+  tools: Array<Pick<ToolInfo, "name" | "description" | "parameters">>,
+  signal: AbortSignal,
+): Promise<{ cacheTokens: number } | null> {
+  if (!ctx.model) return null;
+  const sessionContext = buildSessionContext(ctx.sessionManager.getBranch(), ctx.sessionManager.getLeafId());
+  const response = await ctx.modelRegistry.complete(
+    ctx.model,
+    {
+      systemPrompt: ctx.getSystemPrompt(),
+      messages: [
+        ...convertToLlm(sessionContext.messages),
+        { role: "user", content: REWARM_PROMPT, timestamp: Date.now() },
+      ],
+      tools,
+    },
+    { maxTokens: 1, signal },
+  );
+  if (response.stopReason === "error" || response.stopReason === "aborted") return null;
+  return { cacheTokens: (response.usage?.cacheRead ?? 0) + (response.usage?.cacheWrite ?? 0) };
+}
+
+export function shouldRewarmCache(options: {
+  now: number;
+  rewarmUntilMs: number | null;
+  lastProviderResponseAt: number | null;
+  lastAttemptAnchorAt: number | null;
+  agentBusy: boolean;
+  uiPromptActive: boolean;
+  pendingInput: boolean;
+}): boolean {
+  const { now, rewarmUntilMs, lastProviderResponseAt, lastAttemptAnchorAt } = options;
+  if (rewarmUntilMs === null || now >= rewarmUntilMs || lastProviderResponseAt === null) return false;
+  if (options.agentBusy || options.uiPromptActive || options.pendingInput) return false;
+  if (lastAttemptAnchorAt === lastProviderResponseAt) return false;
+  const elapsed = now - lastProviderResponseAt;
+  return elapsed >= CACHE_TTL_MS - CACHE_REWARM_LEAD_MS && elapsed < CACHE_TTL_MS;
 }
 
 /** Per-million-token pricing pulled from `ctx.model.cost` at the time a cache was written. */
@@ -333,6 +412,7 @@ function asFiniteNumber(value: unknown): number {
 export function reconstructHistory(entries: readonly unknown[], fallbackRates?: CacheCostRates | null): TurnRecord[] {
   type MsgEntry = {
     type: string;
+    customType?: string;
     timestamp?: string;
     message?: {
       role?: string;
@@ -341,7 +421,29 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
       usage?: { input?: unknown; cacheWrite?: unknown; cost?: { cacheWrite?: unknown } };
     };
   };
-  const msgs = (entries as MsgEntry[]).filter(
+  const rawEntries = entries as MsgEntry[];
+  const lastAssistantAtBeforeUser = new Map<MsgEntry, number | null>();
+  let latestAssistantAt: number | null = null;
+  for (const entry of rawEntries) {
+    if (entry.type === "message" && entry.message?.role === "user") {
+      lastAssistantAtBeforeUser.set(entry, latestAssistantAt);
+    } else if (entry.type === "message" && entry.message?.role === "assistant" && typeof entry.timestamp === "string") {
+      const timestamp = Date.parse(entry.timestamp);
+      if (Number.isFinite(timestamp)) latestAssistantAt = timestamp;
+    }
+  }
+  const rewarmAssistantEntries = new Set<MsgEntry>();
+  let rewarmTurnActive = false;
+  for (const entry of rawEntries) {
+    if (entry.type === "custom_message" && entry.customType === "prompt-timer-rewarm") {
+      rewarmTurnActive = true;
+    } else if (entry.type === "message" && entry.message?.role === "user") {
+      rewarmTurnActive = false;
+    } else if (rewarmTurnActive && entry.type === "message" && entry.message?.role === "assistant") {
+      rewarmAssistantEntries.add(entry);
+    }
+  }
+  const msgs = rawEntries.filter(
     (e) => e.type === "message" && e.message != null && typeof e.timestamp === "string",
   );
 
@@ -381,9 +483,10 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
     let firstAssistant: { input: number; cacheWrite: number; cacheWriteCost: number; model?: string } | null = null;
     while (j < msgs.length && msgs[j]!.message?.role !== "user") {
       const m = msgs[j]!.message!;
-      const t = Date.parse(msgs[j]!.timestamp!);
-      if (!Number.isNaN(t)) lastActivityMs = t;
-      if (firstAssistant === null && m.role === "assistant" && m.usage) {
+      const entry = msgs[j]!;
+      const t = Date.parse(entry.timestamp!);
+      if (!Number.isNaN(t) && !rewarmAssistantEntries.has(entry)) lastActivityMs = t;
+      if (firstAssistant === null && m.role === "assistant" && m.usage && !rewarmAssistantEntries.has(entry)) {
         // Transcripts are trusted-local but not type-checked (imported/shared
         // sessions), so coerce at the boundary: a string-typed cost would
         // otherwise pass a > 0 check by coercion and throw later at toFixed.
@@ -399,7 +502,9 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
 
     if (text.length > 0 && !Number.isNaN(userMs)) {
       const waitBeforeMs = lastSettleMs !== null ? Math.max(0, userMs - lastSettleMs) : 0;
-      const rewarm = rewarmForTurn(firstAssistant, waitBeforeMs, fallbackRates ?? null);
+      const previousAssistantAt = lastAssistantAtBeforeUser.get(e);
+      const cacheAgeBeforeMs = previousAssistantAt == null ? 0 : Math.max(0, userMs - previousAssistantAt);
+      const rewarm = rewarmForTurn(firstAssistant, cacheAgeBeforeMs, fallbackRates ?? null);
       turns.push({
         promptText: truncatePrompt(text),
         durationMs: Math.max(0, lastActivityMs - userMs),
@@ -434,6 +539,18 @@ export function findLastAssistantUsage(entries: readonly unknown[]): { cacheRead
     if (m?.type === "message" && m.message?.role === "assistant" && m.message.usage) {
       return { cacheRead: asFiniteNumber(m.message.usage.cacheRead), cacheWrite: asFiniteNumber(m.message.usage.cacheWrite) };
     }
+  }
+  return null;
+}
+
+export function findLastAssistantTimestamp(entries: readonly unknown[]): number | null {
+  type TimestampEntry = { type: string; timestamp?: string; message?: { role?: string } };
+  const msgs = entries as TimestampEntry[];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const entry = msgs[i];
+    if (entry?.type !== "message" || entry.message?.role !== "assistant" || typeof entry.timestamp !== "string") continue;
+    const timestamp = Date.parse(entry.timestamp);
+    if (Number.isFinite(timestamp)) return timestamp;
   }
   return null;
 }
@@ -889,6 +1006,34 @@ export async function writeHistoryFile(
   await nodeFs.promises.writeFile(resolved, body, "utf8");
 }
 
+async function saveRewarmConfig(cwd: string, duration: string): Promise<void> {
+  const configDir = nodePath.join(cwd, nodePath.dirname(REWARM_CONFIG_FILE));
+  const configPath = nodePath.join(cwd, REWARM_CONFIG_FILE);
+  await nodeFs.promises.mkdir(configDir, { recursive: true });
+
+  const cwdReal = await nodeFs.promises.realpath(cwd);
+  const configDirReal = await nodeFs.promises.realpath(configDir);
+  if (configDirReal !== cwdReal && !configDirReal.startsWith(cwdReal + nodePath.sep)) {
+    throw new Error("Config path escapes the project directory through a symlink");
+  }
+
+  let config: Record<string, unknown> = {};
+  try {
+    const stat = await nodeFs.promises.lstat(configPath);
+    if (stat.isSymbolicLink()) throw new Error("Config file must not be a symlink");
+    const parsed: unknown = JSON.parse(await nodeFs.promises.readFile(configPath, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Config must be a JSON object");
+    }
+    config = parsed as Record<string, unknown>;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+
+  config.rewarmDuration = duration;
+  await nodeFs.promises.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -905,6 +1050,12 @@ export default function promptTimer(pi: ExtensionAPI) {
   // to estimate the cost of a cache miss once the TTL has expired.
   let lastCachedTokens = 0;
   let lastCacheCostRates: CacheCostRates | null = null;
+  let rewarmUntilMs: number | null = null;
+  let rewarmDurationMs = 0;
+  let rewarmWindowEnded = false;
+  let lastRewarmAttemptAnchorAt: number | null = null;
+  let rewarmContext: ExtensionContext | null = null;
+  let rewarmAbortController: AbortController | null = null;
   let pendingPromptText = "";
   let pendingInputAt: number | null = null;
   // True while a blocking user-facing prompt/overlay is open.
@@ -953,6 +1104,8 @@ export default function promptTimer(pi: ExtensionAPI) {
   function startTick(): void {
     if (tickTimer !== null) return;
     tickTimer = setInterval(() => {
+      const now = Date.now();
+      maybeRewarmCache(now);
       footerTui?.requestRender();
       if (MIRROR_TO_TITLE_DURING_PROMPTS && uiPromptActive) refreshPromptTitle();
     }, 1000);
@@ -963,6 +1116,59 @@ export default function promptTimer(pi: ExtensionAPI) {
       clearInterval(tickTimer);
       tickTimer = null;
     }
+  }
+
+  function cancelPendingRewarm(): void {
+    const controller = rewarmAbortController;
+    if (!controller) return;
+    rewarmAbortController = null;
+    controller.abort();
+  }
+
+  function maybeRewarmCache(now: number): void {
+    if (rewarmUntilMs !== null && now >= rewarmUntilMs) {
+      rewarmUntilMs = null;
+      rewarmWindowEnded = true;
+      cancelPendingRewarm();
+    }
+    if (
+      rewarmAbortController !== null ||
+      !rewarmContext ||
+      !shouldRewarmCache({
+        now,
+        rewarmUntilMs,
+        lastProviderResponseAt,
+        lastAttemptAnchorAt: lastRewarmAttemptAnchorAt,
+        agentBusy: thinkingStartMs !== null,
+        uiPromptActive: uiPromptActive || ownOverlayOpen,
+        pendingInput: pendingInputAt !== null,
+      })
+    ) {
+      return;
+    }
+
+    const context = rewarmContext;
+    lastRewarmAttemptAnchorAt = lastProviderResponseAt;
+    const controller = new AbortController();
+    rewarmAbortController = controller;
+    const activeTools = new Set(pi.getActiveTools());
+    const tools = pi
+      .getAllTools()
+      .filter((tool) => activeTools.has(tool.name))
+      .map(({ name, description, parameters }) => ({ name, description, parameters }));
+
+    void rewarmProviderCache(context, tools, controller.signal)
+      .then((result) => {
+        if (!result || controller.signal.aborted) return;
+        lastProviderResponseAt = Date.now();
+        lastCachedTokens = result.cacheTokens;
+        lastCacheCostRates = modelCostRates(context);
+        footerTui?.requestRender();
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (rewarmAbortController === controller) rewarmAbortController = null;
+      });
   }
 
   // ── History overlay ────────────────────────────────────────────────────────
@@ -988,6 +1194,7 @@ export default function promptTimer(pi: ExtensionAPI) {
 
     let result: OverlayResult;
     ownOverlayOpen = true;
+    cancelPendingRewarm();
     try {
       result = await ctx.ui.custom<OverlayResult>(
         (tui, theme, _kb, done) => new TimerHistoryComponent(history, liveEntry, sessionName, tui, theme, done),
@@ -1063,11 +1270,13 @@ export default function promptTimer(pi: ExtensionAPI) {
 
   pi.on("input", async (event) => {
     if (event.source === "extension") return;
+    cancelPendingRewarm();
     pendingPromptText = truncatePrompt(event.text);
     pendingInputAt = Date.now();
   });
 
   pi.on("agent_start", async () => {
+    cancelPendingRewarm();
     if (thinkingStartMs === null) thinkingStartMs = Date.now();
     footerTui?.requestRender();
     startTick();
@@ -1087,6 +1296,7 @@ export default function promptTimer(pi: ExtensionAPI) {
   // select, input, custom overlay). Mirror the cache countdown into the title
   // bar since the footer is occluded by the overlay.
   pi.on("ui_prompt_start", async (_event, ctx) => {
+    cancelPendingRewarm();
     uiPromptActive = true;
     if (MIRROR_TO_TITLE_DURING_PROMPTS && ctx.hasUI) {
       titleUi = ctx.ui;
@@ -1119,6 +1329,10 @@ export default function promptTimer(pi: ExtensionAPI) {
     lastProviderResponseAt = null;
     lastCachedTokens = 0;
     lastCacheCostRates = null;
+    rewarmUntilMs = null;
+    rewarmDurationMs = DEFAULT_REWARM_DURATION_MS;
+    rewarmWindowEnded = false;
+    lastRewarmAttemptAnchorAt = null;
     pendingPromptText = "";
     pendingInputAt = null;
     uiPromptActive = false;
@@ -1127,12 +1341,11 @@ export default function promptTimer(pi: ExtensionAPI) {
     // Restore the cache anchor from the transcript so /reload (which preserves
     // context, hence the live prompt cache) keeps the cache-TTL clock ticking.
     // A genuinely new session has no turns, so the footer stays empty (—).
-    const turns = reconstructHistory(ctx.sessionManager.getEntries(), modelCostRates(ctx));
+    const entries = ctx.sessionManager.getEntries();
+    const turns = reconstructHistory(entries, modelCostRates(ctx));
     const lastTurn = turns[turns.length - 1];
-    if (lastTurn) {
-      lastProviderResponseAt = lastTurn.at + lastTurn.durationMs;
-      lastRunMs = lastTurn.durationMs;
-    }
+    if (lastTurn) lastRunMs = lastTurn.durationMs;
+    lastProviderResponseAt = findLastAssistantTimestamp(entries) ?? (lastTurn ? lastTurn.at + lastTurn.durationMs : null);
     const lastUsage = findLastAssistantUsage(ctx.sessionManager.getEntries());
     if (lastUsage) {
       lastCachedTokens = lastUsage.cacheRead + lastUsage.cacheWrite;
@@ -1140,63 +1353,79 @@ export default function promptTimer(pi: ExtensionAPI) {
     }
 
     if (!ctx.hasUI) return;
+    rewarmContext = ctx;
+    rewarmUntilMs = Date.now() + rewarmDurationMs;
+    try {
+      const configPath = nodePath.join(ctx.cwd, REWARM_CONFIG_FILE);
+      const configText = await nodeFs.promises.readFile(configPath, "utf8");
+      rewarmDurationMs = parseRewarmConfig(JSON.parse(configText));
+      rewarmUntilMs = rewarmDurationMs > 0 ? Date.now() + rewarmDurationMs : null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        ctx.ui.notify(`Cache rewarm config ignored: ${(err as Error).message}`, "warning");
+      }
+    }
     titleUi = ctx.ui;
 
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      footerTui = tui;
-      const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
-      startTick();
+    // Own row below the editor (not setFooter), so other extensions' footers and statuses stay intact.
+    const renderTimer = (): void => {
+      const theme = ctx.ui.theme;
+      const now = Date.now();
+      let text: string;
 
-      return {
-        dispose() { unsubBranch(); footerTui = null; },
-        invalidate() {},
-        render(width: number): string[] {
-          const now = Date.now();
-          let left: string;
-
-          if (thinkingStartMs !== null && !uiPromptActive) {
-            // Agent actively working (not blocked on a human prompt).
-            const elapsed = now - thinkingStartMs;
-            left = theme.fg("accent", `⏱  ${formatDuration(elapsed)}  started ${formatTimestamp(thinkingStartMs)}`);
-          } else if (lastProviderResponseAt !== null) {
-            // Idle at prompt, long tool run, or waiting on a human answer — all
-            // expire the cache identically, so show the countdown from the last
-            // provider response.
-            const st = cacheCountdown(lastProviderResponseAt, now);
-            left = theme.fg(st.level, st.text);
-            if (st.level === "error") {
-              const estimate = estimateCacheMissCost(lastCachedTokens, lastCacheCostRates);
-              if (estimate !== null) {
-                left += theme.fg("error", `  · ~${formatEstimatedCost(estimate)} to rebuild`);
-              }
-            }
-            left += theme.fg("dim", `  @${formatTimestamp(lastProviderResponseAt)}`);
-          } else {
-            left = theme.fg("dim", "—");
+      if (thinkingStartMs !== null && !uiPromptActive) {
+        const elapsed = now - thinkingStartMs;
+        text = theme.fg("accent", `⏱  ${formatDuration(elapsed)}  started ${formatTimestamp(thinkingStartMs)}`);
+      } else if (lastProviderResponseAt !== null) {
+        const st = cacheCountdown(lastProviderResponseAt, now);
+        text = theme.fg(st.level, st.text);
+        if (st.level === "error") {
+          const estimate = estimateCacheMissCost(lastCachedTokens, lastCacheCostRates);
+          if (estimate !== null) {
+            text += theme.fg("error", `  · ~${formatEstimatedCost(estimate)} to rebuild`);
           }
+        }
+        text += theme.fg("dim", `  @${formatTimestamp(lastProviderResponseAt)}`);
+      } else {
+        text = theme.fg("dim", "—");
+      }
 
-          if (lastRunMs !== null && thinkingStartMs === null) {
-            left += theme.fg("dim", `   last: ${formatDuration(lastRunMs)}`);
-          }
+      if (lastRunMs !== null && thinkingStartMs === null) {
+        text += theme.fg("dim", `   last: ${formatDuration(lastRunMs)}`);
+      }
 
-          const branch = footerData.getGitBranch();
-          const parts = [ctx.model?.id ?? "", branch ? `(${branch})` : ""].filter(Boolean);
-          const right = parts.length > 0 ? theme.fg("dim", parts.join(" ")) : "";
-          const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(right));
-          return [truncateToWidth(left + " ".repeat(gap) + right, width)];
-        },
-      };
-    });
+      const rewarmLabel = rewarmAbortController !== null
+        ? "⟳ rewarming…"
+        : rewarmUntilMs !== null
+          ? `⟳ rewarm active · ${formatDurationCoarse(Math.max(0, rewarmUntilMs - now))} left`
+          : rewarmWindowEnded
+            ? `⏹ rewarm window ended (${formatDurationCoarse(rewarmDurationMs)})`
+            : null;
+      if (rewarmLabel) {
+        const color = rewarmWindowEnded ? "warning" : "accent";
+        text = `${theme.fg(color, rewarmLabel)}  · ${text}`;
+      }
+      ctx.ui.setWidget(TIMER_WIDGET_KEY, [text], { placement: "belowEditor" });
+    };
+    footerTui = { requestRender: renderTimer };
+    renderTimer();
+    startTick();
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     stopTick();
     footerTui = null;
     thinkingStartMs = null;
+    rewarmUntilMs = null;
+    rewarmDurationMs = 0;
+    rewarmWindowEnded = false;
+    lastRewarmAttemptAnchorAt = null;
+    cancelPendingRewarm();
+    rewarmContext = null;
     uiPromptActive = false;
     ownOverlayOpen = false;
     if (ctx.hasUI) {
-      ctx.ui.setFooter(undefined);
+      ctx.ui.setWidget(TIMER_WIDGET_KEY, undefined);
       if (MIRROR_TO_TITLE_DURING_PROMPTS) ctx.ui.setTitle(baseTitle());
     }
     titleUi = null;
@@ -1205,8 +1434,50 @@ export default function promptTimer(pi: ExtensionAPI) {
   // ── Commands & shortcuts ───────────────────────────────────────────────────
 
   pi.registerCommand("timer", {
-    description: "Show timing history for this session (agent duration per prompt + idle gaps)",
-    handler: (_args, ctx) => showHistory(ctx),
+    description: "Show timing history or configure automatic cache rewarming",
+    handler: async (args, ctx) => {
+      const [subcommand, value, ...extra] = args.trim().split(/\s+/);
+      if (!subcommand) return showHistory(ctx);
+      if (subcommand.toLowerCase() !== "rewarm" || extra.length > 0) {
+        ctx.ui.notify("Usage: /timer [rewarm [<1m..24h|off|status>]]", "warning");
+        return;
+      }
+      if (!value || value.toLowerCase() === "status") {
+        const remaining = rewarmUntilMs === null ? 0 : Math.max(0, rewarmUntilMs - Date.now());
+        ctx.ui.notify(
+          rewarmWindowEnded
+            ? `Automatic cache rewarming window ended after ${formatDurationCoarse(rewarmDurationMs)}.`
+            : remaining > 0
+              ? `Automatic cache rewarming is active for ${formatDuration(remaining)}.`
+              : "Automatic cache rewarming is off.",
+          "info",
+        );
+        return;
+      }
+
+      const durationMs = parseRewarmDuration(value);
+      if (durationMs === null) {
+        ctx.ui.notify('Use /timer rewarm <1m..24h> or /timer rewarm off.', "error");
+        return;
+      }
+      try {
+        await saveRewarmConfig(ctx.cwd, value.toLowerCase());
+        cancelPendingRewarm();
+        rewarmDurationMs = durationMs;
+        rewarmWindowEnded = false;
+        rewarmUntilMs = durationMs > 0 ? Date.now() + durationMs : null;
+        lastRewarmAttemptAnchorAt = null;
+        startTick();
+        ctx.ui.notify(
+          durationMs > 0
+            ? `Automatic cache rewarming enabled for ${value.toLowerCase()}.`
+            : "Automatic cache rewarming is off.",
+          "info",
+        );
+      } catch (err) {
+        ctx.ui.notify(`Could not save cache rewarm config: ${(err as Error).message}`, "error");
+      }
+    },
   });
 
   pi.registerShortcut("ctrl+alt+t", {

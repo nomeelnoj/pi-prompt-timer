@@ -81,6 +81,30 @@ The footer updates every second and reflects one of three states:
 The idle clock is anchored to the last completed provider response, so it counts correctly whether you are idle at the
 prompt, waiting on a long-running tool, or answering a blocking question. It is restored from the session transcript on
 `/reload`, so reloading plugins never resets the cache clock; only a brand-new session (`/new`) starts empty.
+The timer renders as its own row below the editor and does not replace the footer, so other extensions' footers and
+statuses (for example `snap:ready`) are left alone. The rewarm labels are part of that row.
+
+### Automatic cache rewarming
+
+Automatic rewarming is on by default for the first hour of each session. Each rewarm makes a real provider request
+using the current system prompt, conversation context, and active tools. The extension adds a temporary one-character
+prompt 75 seconds before the 5-minute cache TTL, limits generation to one token, and discards the response. Neither
+the prompt nor response is appended to the session or transcript. The footer marks the active window, an in-flight
+rewarm, and when the configured window ends. Rewarming runs only while Pi is idle and no blocking prompt or timer
+overlay is open; if the cache has already expired, it waits for the next normal response.
+
+Override the project default in `.pi/prompt-timer.json`; for example, set it to `off` to disable automatic rewarming:
+
+```json
+{
+  "rewarmDuration": "off"
+}
+```
+
+Or set it for the current project with `/timer rewarm 1h`. The command saves that setting to the same file and starts
+the window immediately. `/timer rewarm status` reports the remaining time; `/timer rewarm off` stops rewarming and
+persists the disabled setting. Durations use whole minutes or hours from `1m` through `24h`. A configured duration
+starts when the session loads; the command starts it when invoked. With no config, the default is `1h`.
 
 ### History overlay
 
