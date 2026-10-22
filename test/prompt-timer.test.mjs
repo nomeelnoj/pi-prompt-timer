@@ -20,6 +20,12 @@ const {
   parseRewarmDuration,
   parseRewarmConfig,
   shouldRewarmCache,
+  summarizePayload,
+  diffPayloadSummaries,
+  canRewarmReplay,
+  rewarmBlockReason,
+  piWarmsCache,
+  findLastCacheWarm,
   rewarmProviderCache,
   estimateCacheMissCost,
   formatEstimatedCost,
@@ -95,16 +101,19 @@ test("backend-only rewarm calls the provider without changing session entries", 
     getSystemPrompt: () => "system prompt",
     sessionManager: { getBranch: () => entries, getLeafId: () => "assistant-entry" },
     modelRegistry: {
-      complete: async (...args) => {
+      streamSimple: (...args) => {
         calls.push(args);
-        return { stopReason: "stop", usage: { cacheRead: 200, cacheWrite: 3 } };
+        return { result: async () => ({ stopReason: "stop", usage: { cacheRead: 200, cacheWrite: 3 } }) };
       },
     },
   };
 
-  const warmed = await rewarmProviderCache(ctx, [tool], new AbortController().signal);
+  const warmed = await rewarmProviderCache(ctx, [tool], new AbortController().signal, {
+    thinkingLevel: "high",
+    sessionId: "session-1",
+  });
 
-  assert.deepEqual(warmed, { cacheTokens: 203 });
+  assert.deepEqual(warmed, { cacheTokens: 203, cacheRead: 200 });
   assert.deepEqual(entries, originalEntries);
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], ctx.model);
@@ -114,6 +123,8 @@ test("backend-only rewarm calls the provider without changing session entries", 
   assert.equal(calls[0][1].messages.at(-1).content, ".");
   assert.deepEqual(calls[0][1].tools, [tool]);
   assert.equal(calls[0][2].maxTokens, 1);
+  assert.equal(calls[0][2].reasoning, "high");
+  assert.equal(calls[0][2].sessionId, "session-1");
 });
 
 test("scheduled cache rewarming calls the backend without sending a session message", async () => {
@@ -163,11 +174,11 @@ test("scheduled cache rewarming calls the backend without sending a session mess
     hasUI: true,
     cwd,
     model: { provider: "mock-provider", id: "mock-model", cost: { input: 1, cacheRead: 0, cacheWrite: 0 } },
-    sessionManager: { getEntries: () => entries, getBranch: () => entries, getLeafId: () => "assistant-entry" },
+    sessionManager: { getEntries: () => entries, getBranch: () => entries, getLeafId: () => "assistant-entry", getSessionId: () => "session-1" },
     modelRegistry: {
-      complete: async () => {
+      streamSimple: () => {
         backendCalls++;
-        return { stopReason: "stop" };
+        return { result: async () => ({ stopReason: "stop" }) };
       },
     },
     getSystemPrompt: () => "system prompt",
@@ -186,6 +197,7 @@ test("scheduled cache rewarming calls the backend without sending a session mess
     registerCommand: (name, command) => commands.set(name, command.handler),
     registerShortcut() {},
     getSessionName: () => undefined,
+    getThinkingLevel: () => "off",
     getActiveTools: () => [],
     getAllTools: () => [],
     sendMessage: () => { sessionMessages++; },
@@ -218,6 +230,11 @@ test("scheduled cache rewarming calls the backend without sending a session mess
     assert.match(endedText, /cache TTL expired/);
     await commands.get("timer")("rewarm status", ctx);
     assert.match(notifications.at(-1), /window ended after 1h/);
+    await handlers.get("input")({ source: "interactive", text: "next" }, ctx);
+    intervals[0]();
+    const restartedText = footer.render(120).join("");
+    assert.match(restartedText, /rewarm active · 1h left/);
+    assert.doesNotMatch(restartedText, /window ended/);
     await handlers.get("session_shutdown")({}, ctx);
     assert.equal(widgets.has("prompt-timer"), false);
   } finally {
@@ -804,4 +821,95 @@ test("writeHistoryFile writes inside the project on the normal path", async () =
   await writeHistoryFile(".scratch/history.md", root, [], undefined, "markdown");
   const body = await readFile(join(root, ".scratch", "history.md"), "utf8");
   assert.match(body, /# Timer History/);
+});
+
+test("rewarmProviderCache surfaces provider errors instead of swallowing them", async () => {
+  const ctx = {
+    model: { provider: "mock-provider", id: "mock-model" },
+    getSystemPrompt: () => "system prompt",
+    sessionManager: { getBranch: () => [], getLeafId: () => null },
+    modelRegistry: {
+      streamSimple: () => ({ result: async () => ({ stopReason: "error", errorMessage: "rate limited" }) }),
+    },
+  };
+  await assert.rejects(rewarmProviderCache(ctx, [], new AbortController().signal), /rate limited/);
+});
+
+test("rewarmBlockReason names what is holding a due rewarm back", () => {
+  const idle = { agentBusy: false, uiPromptActive: false, pendingInput: false };
+  assert.equal(rewarmBlockReason(idle), null);
+  assert.equal(rewarmBlockReason({ ...idle, agentBusy: true }), "agent busy");
+  assert.equal(rewarmBlockReason({ ...idle, uiPromptActive: true }), "prompt open");
+  assert.equal(rewarmBlockReason({ ...idle, pendingInput: true }), "input pending");
+});
+
+test("canRewarmReplay rejects only Anthropic budget-based thinking", () => {
+  const anthropic = { api: "anthropic-messages", compat: {} };
+  assert.equal(canRewarmReplay(anthropic, "off"), true);
+  assert.equal(canRewarmReplay(anthropic, "high"), false);
+  assert.equal(canRewarmReplay({ api: "anthropic-messages", compat: { forceAdaptiveThinking: true } }, "high"), true);
+  assert.equal(canRewarmReplay({ api: "openai-responses" }, "high"), true);
+});
+
+test("payload diff ignores cache_control moves and pinpoints real divergences", () => {
+  const user = (text, marked) => ({ role: "user", content: [{ type: "text", text, ...(marked ? { cache_control: { type: "ephemeral" } } : {}) }] });
+  const assistant = { role: "assistant", content: [{ type: "text", text: "ok" }] };
+  const real = summarizePayload({
+    model: "m",
+    thinking: { type: "adaptive" },
+    messages: [user("a"), assistant, user("b", true)],
+  });
+  const same = summarizePayload({
+    model: "m",
+    thinking: { type: "adaptive" },
+    messages: [user("a"), assistant, user("b"), assistant, user(".", true)],
+  });
+  assert.deepEqual(diffPayloadSummaries(real, same), [
+    "messages: real 3 items, rewarm 5; identical prefix 3; cache_control at real [2] rewarm [4]",
+    "  rewarm appends: assistant[text] | user[text] +cache_control",
+  ]);
+
+  const drifted = summarizePayload({ model: "m", messages: [user("a"), assistant, user("changed", true)] });
+  const lines = diffPayloadSummaries(real, drifted);
+  assert.ok(lines.some((line) => line.startsWith("thinking: only in real request")));
+  assert.ok(lines.some((line) => line.includes("first difference @2")));
+});
+
+test("piWarmsCache is true only when the model declares a lifetime for the active retention tier", () => {
+  const saved = process.env.PI_CACHE_RETENTION;
+  try {
+    delete process.env.PI_CACHE_RETENTION;
+    assert.equal(piWarmsCache({ promptCache: { short: 300, long: 3600 } }), true);
+    assert.equal(piWarmsCache({ promptCache: { short: 300 } }), true);
+    assert.equal(piWarmsCache({ promptCache: { long: 3600 } }), false);
+    assert.equal(piWarmsCache({ promptCache: { short: 0 } }), false);
+    assert.equal(piWarmsCache({}), false);
+    assert.equal(piWarmsCache(undefined), false);
+    assert.equal(piWarmsCache(null), false);
+    process.env.PI_CACHE_RETENTION = "long";
+    assert.equal(piWarmsCache({ promptCache: { short: 300 } }), false);
+    assert.equal(piWarmsCache({ promptCache: { long: 3600 } }), true);
+  } finally {
+    if (saved === undefined) delete process.env.PI_CACHE_RETENTION;
+    else process.env.PI_CACHE_RETENTION = saved;
+  }
+});
+
+test("findLastCacheWarm returns only a warm newer than the last assistant message", () => {
+  const assistant = (timestamp) => ({ type: "message", timestamp, message: { role: "assistant" } });
+  const warm = (timestamp, cacheRead, cacheWrite) => ({
+    type: "usage",
+    kind: "cache_warm",
+    timestamp,
+    usage: { cacheRead, cacheWrite },
+  });
+
+  assert.deepEqual(
+    findLastCacheWarm([assistant("2026-01-01T00:00:00Z"), warm("2026-01-01T00:04:00Z", 100, 20), warm("2026-01-01T00:08:00Z", 130, 0)]),
+    { at: Date.parse("2026-01-01T00:08:00Z"), cacheTokens: 130 },
+  );
+  assert.equal(findLastCacheWarm([warm("2026-01-01T00:04:00Z", 100, 0), assistant("2026-01-01T00:05:00Z")]), null);
+  assert.equal(findLastCacheWarm([{ type: "usage", kind: "compaction", timestamp: "2026-01-01T00:04:00Z" }]), null);
+  assert.equal(findLastCacheWarm([{ type: "usage", kind: "cache_warm", timestamp: "not a date" }]), null);
+  assert.equal(findLastCacheWarm([]), null);
 });
