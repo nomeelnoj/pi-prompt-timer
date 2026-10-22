@@ -81,6 +81,36 @@ The footer updates every second and reflects one of three states:
 The idle clock is anchored to the last completed provider response, so it counts correctly whether you are idle at the
 prompt, waiting on a long-running tool, or answering a blocking question. It is restored from the session transcript on
 `/reload`, so reloading plugins never resets the cache clock; only a brand-new session (`/new`) starts empty.
+The timer renders as its own row below the editor and does not replace the footer, so other extensions' footers and
+statuses (for example `snap:ready`) are left alone. The rewarm labels are part of that row.
+
+### Automatic cache rewarming
+
+Automatic rewarming is on by default and stays active for one hour after your last message. Each rewarm makes a real
+provider request using the current system prompt, conversation context, and active tools. The extension adds a
+temporary one-character prompt 75 seconds before the 5-minute cache TTL, limits generation to one token, and discards
+the response. Neither the prompt nor response is appended to the session or transcript. The footer marks the active
+window, an in-flight rewarm, and when the window ends after no messages for the configured duration. Rewarming runs
+only while Pi is idle and no blocking prompt or timer overlay is open; if the cache has already expired, it waits
+for the next normal response.
+
+Pi has its own idle cache warmer (`cacheWarming` in `settings.json`), but it only runs for models that declare a cache
+lifetime (`promptCache`). Pi's catalog declares one only for direct Anthropic, so this extension defers to Pi for those
+models (the footer shows `cache warmed by Pi`) and rewarms every other model itself. Models behind a proxy such as
+LiteLLM can opt into Pi's warmer by declaring a lifetime, for example with a `modelOverrides` entry.
+
+Override the project default in `.pi/prompt-timer.json`; for example, set it to `off` to disable automatic rewarming:
+
+```json
+{
+  "rewarmDuration": "off"
+}
+```
+
+Or set it for the current project with `/timer rewarm 1h`. The command saves that setting to the same file and starts
+the window immediately. `/timer rewarm status` reports the remaining time; `/timer rewarm off` stops rewarming and
+persists the disabled setting. Durations use whole minutes or hours from `1m` through `24h`. The window starts when the
+session loads or the command runs, and restarts each time you send a message. With no config, the default is `1h`.
 
 ### History overlay
 

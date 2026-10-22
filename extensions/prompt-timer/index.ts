@@ -36,7 +36,14 @@
  *   response (last assistant message end), not to agent-idle state.
  */
 
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import {
+  buildSessionContext,
+  convertToLlm,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type Theme,
+  type ToolInfo,
+} from "@earendil-works/pi-coding-agent";
 import {
   Key,
   matchesKey,
@@ -44,6 +51,7 @@ import {
   type TUI,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as nodePath from "node:path";
 
@@ -53,6 +61,15 @@ import * as nodePath from "node:path";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_WARN_MS = 4 * 60 * 1000;
+const CACHE_REWARM_LEAD_MS = 75 * 1000;
+const REWARM_RETRY_MS = 15 * 1000;
+const DEFAULT_REWARM_DURATION_MS = 60 * 60 * 1000;
+const MAX_REWARM_DURATION_MS = 24 * 60 * 60 * 1000;
+const REWARM_CONFIG_FILE = ".pi/prompt-timer.json";
+const TIMER_WIDGET_KEY = "prompt-timer";
+const REWARM_PROMPT = ".";
+const REWARM_DEBUG = process.env.PI_PROMPT_TIMER_DEBUG === "1";
+const REWARM_DEBUG_DIR = ".scratch/prompt-timer-debug";
 
 /**
  * Mirror the cache-TTL countdown into the terminal title bar while a blocking
@@ -181,6 +198,204 @@ export function cacheCountdown(sinceMs: number, now: number): { text: string; le
     return { text: `⌛ ${dur}  · cache TTL expires in ${rem}`, level };
   }
   return { text: `⌛ ${dur}`, level };
+}
+
+/** Parse a cache-rewarm duration such as "1h" or "15m"; zero disables it. */
+export function parseRewarmDuration(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "off") return 0;
+  const match = /^(\d+)(m|h)$/.exec(normalized);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const durationMs = amount * (match[2] === "h" ? 60 * 60 * 1000 : 60 * 1000);
+  return Number.isSafeInteger(durationMs) && durationMs >= 60_000 && durationMs <= MAX_REWARM_DURATION_MS
+    ? durationMs
+    : null;
+}
+
+/** Read the persisted duration, defaulting to one hour when unset. */
+export function parseRewarmConfig(value: unknown): number {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Config must be a JSON object");
+  }
+  const duration = (value as { rewarmDuration?: unknown }).rewarmDuration;
+  if (duration === undefined) return DEFAULT_REWARM_DURATION_MS;
+  const parsed = parseRewarmDuration(duration);
+  if (parsed === null) throw new Error('"rewarmDuration" must be "off" or a duration from 1m to 24h');
+  return parsed;
+}
+
+/** Request settings that must match the real turns for the provider to read the same cache entry. */
+export type RewarmRequestOptions = {
+  thinkingLevel?: string;
+  sessionId?: string;
+  onPayload?: (payload: unknown) => void;
+};
+
+/**
+ * Anthropic budget-based thinking derives `budget_tokens` from `max_tokens`, so a
+ * one-token replay changes the cache key (and is rejected). Mirrors pi's own cache warmer.
+ */
+export function canRewarmReplay(model: ExtensionContext["model"], thinkingLevel?: string): boolean {
+  if (!model || !thinkingLevel || thinkingLevel === "off") return true;
+  if (model.api !== "anthropic-messages") return true;
+  return (model as { compat?: { forceAdaptiveThinking?: boolean } }).compat?.forceAdaptiveThinking === true;
+}
+
+export async function rewarmProviderCache(
+  ctx: ExtensionContext,
+  tools: Array<Pick<ToolInfo, "name" | "description" | "parameters">>,
+  signal: AbortSignal,
+  request: RewarmRequestOptions = {},
+): Promise<{ cacheTokens: number; cacheRead: number } | null> {
+  if (!ctx.model) return null;
+  const reasoning = request.thinkingLevel && request.thinkingLevel !== "off" ? request.thinkingLevel : undefined;
+  const sessionContext = buildSessionContext(ctx.sessionManager.getBranch(), ctx.sessionManager.getLeafId());
+  const llmContext = {
+    systemPrompt: ctx.getSystemPrompt(),
+    messages: [
+      ...convertToLlm(sessionContext.messages),
+      { role: "user" as const, content: REWARM_PROMPT, timestamp: Date.now() },
+    ],
+    tools,
+  };
+  // streamSimple (not complete) so thinking and session settings match the real requests;
+  // older pi versions only expose complete().
+  const registry = ctx.modelRegistry as unknown as {
+    streamSimple?: (model: unknown, context: unknown, options: unknown) => { result(): Promise<any> };
+    complete: (model: unknown, context: unknown, options: unknown) => Promise<any>;
+  };
+  const response = registry.streamSimple
+    ? await registry
+        .streamSimple(ctx.model, llmContext, {
+          maxTokens: 1,
+          signal,
+          reasoning,
+          sessionId: request.sessionId,
+          onPayload: request.onPayload && ((payload: unknown) => (request.onPayload?.(payload), undefined)),
+        })
+        .result()
+    : await registry.complete(ctx.model, llmContext, { maxTokens: 1, signal });
+  if (response.stopReason === "aborted") return null;
+  if (response.stopReason === "error") throw new Error(response.errorMessage || "provider error");
+  const cacheRead = response.usage?.cacheRead ?? 0;
+  return { cacheTokens: cacheRead + (response.usage?.cacheWrite ?? 0), cacheRead };
+}
+
+// ── Debug: compare the rewarm payload with the last real one ───────────────
+
+type PayloadEntry = { hash: string; items?: Array<{ hash: string; desc: string }>; value?: string };
+export type PayloadSummary = Record<string, PayloadEntry>;
+
+const shortHash = (value: unknown): string =>
+  createHash("sha256").update(JSON.stringify(value) ?? "").digest("hex").slice(0, 8);
+
+// cache_control marks a breakpoint but is not part of the cached content.
+function stripCacheControl(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripCacheControl);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, inner] of Object.entries(value)) if (key !== "cache_control") out[key] = stripCacheControl(inner);
+    return out;
+  }
+  return value;
+}
+
+function describePayloadItem(item: unknown): string {
+  const obj = (item ?? {}) as { role?: string; type?: string; content?: unknown };
+  const blocks = Array.isArray(obj.content)
+    ? obj.content.map((block) => (block as { type?: string })?.type ?? "?").join(",")
+    : typeof obj.content === "string"
+      ? "text"
+      : "";
+  const marked = JSON.stringify(item).includes('"cache_control"') ? " +cache_control" : "";
+  return `${obj.role ?? obj.type ?? typeof item}[${blocks}]${marked}`.slice(0, 120);
+}
+
+/** Hash each top-level payload field (and each array item) so two requests can be compared without storing content. */
+export function summarizePayload(payload: unknown): PayloadSummary {
+  const out: PayloadSummary = {};
+  if (!payload || typeof payload !== "object") return out;
+  for (const [key, raw] of Object.entries(payload)) {
+    const entry: PayloadEntry = { hash: shortHash(stripCacheControl(raw)) };
+    if (Array.isArray(raw)) {
+      entry.items = raw.map((item) => ({ hash: shortHash(stripCacheControl(item)), desc: describePayloadItem(item) }));
+    } else {
+      const text = JSON.stringify(raw) ?? "";
+      if (text.length <= 200) entry.value = text;
+    }
+    out[key] = entry;
+  }
+  return out;
+}
+
+export function diffPayloadSummaries(real: PayloadSummary, rewarm: PayloadSummary): string[] {
+  const lines: string[] = [];
+  for (const key of new Set([...Object.keys(real), ...Object.keys(rewarm)])) {
+    const a = real[key];
+    const b = rewarm[key];
+    if (!a || !b) {
+      lines.push(`${key}: only in ${a ? "real" : "rewarm"} request${(a ?? b)?.value ? ` = ${(a ?? b)?.value}` : ""}`);
+    } else if (a.items && b.items) {
+      let common = 0;
+      while (common < Math.min(a.items.length, b.items.length) && a.items[common]?.hash === b.items[common]?.hash) common++;
+      const marks = (entry: PayloadEntry) =>
+        (entry.items ?? []).flatMap((item, index) => (item.desc.includes("+cache_control") ? [index] : [])).join(",");
+      lines.push(
+        `${key}: real ${a.items.length} items, rewarm ${b.items.length}; identical prefix ${common}; ` +
+          `cache_control at real [${marks(a)}] rewarm [${marks(b)}]`,
+      );
+      if (common < Math.min(a.items.length, b.items.length)) {
+        lines.push(`  first difference @${common}: real ${a.items[common]?.desc} | rewarm ${b.items[common]?.desc}`);
+      } else if (b.items.length > a.items.length) {
+        lines.push(`  rewarm appends: ${b.items.slice(a.items.length).map((item) => item.desc).join(" | ")}`);
+      }
+    } else if (a.hash !== b.hash) {
+      lines.push(`${key}: differs${a.value !== undefined || b.value !== undefined ? ` real=${a.value ?? "<large>"} rewarm=${b.value ?? "<large>"}` : " (large value)"}`);
+    }
+  }
+  return lines;
+}
+
+/** Why a rewarm due now is not running, or null when nothing blocks it. */
+export function rewarmBlockReason(options: {
+  agentBusy: boolean;
+  uiPromptActive: boolean;
+  pendingInput: boolean;
+}): string | null {
+  if (options.agentBusy) return "agent busy";
+  if (options.uiPromptActive) return "prompt open";
+  if (options.pendingInput) return "input pending";
+  return null;
+}
+
+/**
+ * Pi warms an idle cache itself for any model that declares a lifetime for the active retention tier
+ * (`promptCache`, which Pi's catalog sets only for direct Anthropic). Those models are left to Pi so the
+ * cache is never warmed twice; this extension covers the rest.
+ */
+export function piWarmsCache(model: unknown): boolean {
+  const promptCache = (model as { promptCache?: Record<string, unknown> } | null | undefined)?.promptCache;
+  const lifetime = promptCache?.[process.env.PI_CACHE_RETENTION === "long" ? "long" : "short"];
+  return typeof lifetime === "number" && lifetime > 0;
+}
+
+export function shouldRewarmCache(options: {
+  now: number;
+  rewarmUntilMs: number | null;
+  lastProviderResponseAt: number | null;
+  lastAttemptAnchorAt: number | null;
+  agentBusy: boolean;
+  uiPromptActive: boolean;
+  pendingInput: boolean;
+}): boolean {
+  const { now, rewarmUntilMs, lastProviderResponseAt, lastAttemptAnchorAt } = options;
+  if (rewarmUntilMs === null || now >= rewarmUntilMs || lastProviderResponseAt === null) return false;
+  if (options.agentBusy || options.uiPromptActive || options.pendingInput) return false;
+  if (lastAttemptAnchorAt === lastProviderResponseAt) return false;
+  const elapsed = now - lastProviderResponseAt;
+  return elapsed >= CACHE_TTL_MS - CACHE_REWARM_LEAD_MS && elapsed < CACHE_TTL_MS;
 }
 
 /** Per-million-token pricing pulled from `ctx.model.cost` at the time a cache was written. */
@@ -333,6 +548,7 @@ function asFiniteNumber(value: unknown): number {
 export function reconstructHistory(entries: readonly unknown[], fallbackRates?: CacheCostRates | null): TurnRecord[] {
   type MsgEntry = {
     type: string;
+    customType?: string;
     timestamp?: string;
     message?: {
       role?: string;
@@ -341,7 +557,29 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
       usage?: { input?: unknown; cacheWrite?: unknown; cost?: { cacheWrite?: unknown } };
     };
   };
-  const msgs = (entries as MsgEntry[]).filter(
+  const rawEntries = entries as MsgEntry[];
+  const lastAssistantAtBeforeUser = new Map<MsgEntry, number | null>();
+  let latestAssistantAt: number | null = null;
+  for (const entry of rawEntries) {
+    if (entry.type === "message" && entry.message?.role === "user") {
+      lastAssistantAtBeforeUser.set(entry, latestAssistantAt);
+    } else if (entry.type === "message" && entry.message?.role === "assistant" && typeof entry.timestamp === "string") {
+      const timestamp = Date.parse(entry.timestamp);
+      if (Number.isFinite(timestamp)) latestAssistantAt = timestamp;
+    }
+  }
+  const rewarmAssistantEntries = new Set<MsgEntry>();
+  let rewarmTurnActive = false;
+  for (const entry of rawEntries) {
+    if (entry.type === "custom_message" && entry.customType === "prompt-timer-rewarm") {
+      rewarmTurnActive = true;
+    } else if (entry.type === "message" && entry.message?.role === "user") {
+      rewarmTurnActive = false;
+    } else if (rewarmTurnActive && entry.type === "message" && entry.message?.role === "assistant") {
+      rewarmAssistantEntries.add(entry);
+    }
+  }
+  const msgs = rawEntries.filter(
     (e) => e.type === "message" && e.message != null && typeof e.timestamp === "string",
   );
 
@@ -381,9 +619,10 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
     let firstAssistant: { input: number; cacheWrite: number; cacheWriteCost: number; model?: string } | null = null;
     while (j < msgs.length && msgs[j]!.message?.role !== "user") {
       const m = msgs[j]!.message!;
-      const t = Date.parse(msgs[j]!.timestamp!);
-      if (!Number.isNaN(t)) lastActivityMs = t;
-      if (firstAssistant === null && m.role === "assistant" && m.usage) {
+      const entry = msgs[j]!;
+      const t = Date.parse(entry.timestamp!);
+      if (!Number.isNaN(t) && !rewarmAssistantEntries.has(entry)) lastActivityMs = t;
+      if (firstAssistant === null && m.role === "assistant" && m.usage && !rewarmAssistantEntries.has(entry)) {
         // Transcripts are trusted-local but not type-checked (imported/shared
         // sessions), so coerce at the boundary: a string-typed cost would
         // otherwise pass a > 0 check by coercion and throw later at toFixed.
@@ -399,7 +638,9 @@ export function reconstructHistory(entries: readonly unknown[], fallbackRates?: 
 
     if (text.length > 0 && !Number.isNaN(userMs)) {
       const waitBeforeMs = lastSettleMs !== null ? Math.max(0, userMs - lastSettleMs) : 0;
-      const rewarm = rewarmForTurn(firstAssistant, waitBeforeMs, fallbackRates ?? null);
+      const previousAssistantAt = lastAssistantAtBeforeUser.get(e);
+      const cacheAgeBeforeMs = previousAssistantAt == null ? 0 : Math.max(0, userMs - previousAssistantAt);
+      const rewarm = rewarmForTurn(firstAssistant, cacheAgeBeforeMs, fallbackRates ?? null);
       turns.push({
         promptText: truncatePrompt(text),
         durationMs: Math.max(0, lastActivityMs - userMs),
@@ -434,6 +675,42 @@ export function findLastAssistantUsage(entries: readonly unknown[]): { cacheRead
     if (m?.type === "message" && m.message?.role === "assistant" && m.message.usage) {
       return { cacheRead: asFiniteNumber(m.message.usage.cacheRead), cacheWrite: asFiniteNumber(m.message.usage.cacheWrite) };
     }
+  }
+  return null;
+}
+
+/**
+ * Latest Pi cache-warm refresh (`usage` entry, kind `cache_warm`) newer than the last assistant message.
+ * Pi's warmer extends the provider cache without a message, so it resets the TTL clock too.
+ */
+export function findLastCacheWarm(entries: readonly unknown[]): { at: number; cacheTokens: number } | null {
+  type WarmEntry = {
+    type: string;
+    kind?: string;
+    timestamp?: string;
+    usage?: { cacheRead?: unknown; cacheWrite?: unknown };
+    message?: { role?: string };
+  };
+  const all = entries as WarmEntry[];
+  for (let i = all.length - 1; i >= 0; i--) {
+    const entry = all[i];
+    if (entry?.type === "message" && entry.message?.role === "assistant") return null;
+    if (entry?.type !== "usage" || entry.kind !== "cache_warm" || typeof entry.timestamp !== "string") continue;
+    const at = Date.parse(entry.timestamp);
+    if (!Number.isFinite(at)) continue;
+    return { at, cacheTokens: asFiniteNumber(entry.usage?.cacheRead) + asFiniteNumber(entry.usage?.cacheWrite) };
+  }
+  return null;
+}
+
+export function findLastAssistantTimestamp(entries: readonly unknown[]): number | null {
+  type TimestampEntry = { type: string; timestamp?: string; message?: { role?: string } };
+  const msgs = entries as TimestampEntry[];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const entry = msgs[i];
+    if (entry?.type !== "message" || entry.message?.role !== "assistant" || typeof entry.timestamp !== "string") continue;
+    const timestamp = Date.parse(entry.timestamp);
+    if (Number.isFinite(timestamp)) return timestamp;
   }
   return null;
 }
@@ -889,6 +1166,34 @@ export async function writeHistoryFile(
   await nodeFs.promises.writeFile(resolved, body, "utf8");
 }
 
+async function saveRewarmConfig(cwd: string, duration: string): Promise<void> {
+  const configDir = nodePath.join(cwd, nodePath.dirname(REWARM_CONFIG_FILE));
+  const configPath = nodePath.join(cwd, REWARM_CONFIG_FILE);
+  await nodeFs.promises.mkdir(configDir, { recursive: true });
+
+  const cwdReal = await nodeFs.promises.realpath(cwd);
+  const configDirReal = await nodeFs.promises.realpath(configDir);
+  if (configDirReal !== cwdReal && !configDirReal.startsWith(cwdReal + nodePath.sep)) {
+    throw new Error("Config path escapes the project directory through a symlink");
+  }
+
+  let config: Record<string, unknown> = {};
+  try {
+    const stat = await nodeFs.promises.lstat(configPath);
+    if (stat.isSymbolicLink()) throw new Error("Config file must not be a symlink");
+    const parsed: unknown = JSON.parse(await nodeFs.promises.readFile(configPath, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Config must be a JSON object");
+    }
+    config = parsed as Record<string, unknown>;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+
+  config.rewarmDuration = duration;
+  await nodeFs.promises.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -905,6 +1210,16 @@ export default function promptTimer(pi: ExtensionAPI) {
   // to estimate the cost of a cache miss once the TTL has expired.
   let lastCachedTokens = 0;
   let lastCacheCostRates: CacheCostRates | null = null;
+  let rewarmUntilMs: number | null = null;
+  let rewarmDurationMs = 0;
+  let rewarmWindowEnded = false;
+  let lastRewarmAttemptAnchorAt: number | null = null;
+  let rewarmContext: ExtensionContext | null = null;
+  let rewarmOutcome: string | null = null;
+  let lastRealPayload: PayloadSummary | null = null;
+  let rewarmBlocker: string | null = null;
+  let rewarmRetryAt = 0;
+  let rewarmAbortController: AbortController | null = null;
   let pendingPromptText = "";
   let pendingInputAt: number | null = null;
   // True while a blocking user-facing prompt/overlay is open.
@@ -950,9 +1265,26 @@ export default function promptTimer(pi: ExtensionAPI) {
 
   // ── Tick loop ──────────────────────────────────────────────────────────────
 
+  /** Pull Pi's own cache-warm refreshes into the TTL clock. */
+  function syncPiCacheWarm(): void {
+    if (!rewarmContext) return;
+    try {
+      const warm = findLastCacheWarm(rewarmContext.sessionManager.getEntries());
+      if (!warm || (lastProviderResponseAt !== null && warm.at <= lastProviderResponseAt)) return;
+      lastProviderResponseAt = warm.at;
+      lastCachedTokens = warm.cacheTokens;
+      lastCacheCostRates = modelCostRates(rewarmContext);
+    } catch {
+      // A transient session read failure must not break the tick.
+    }
+  }
+
   function startTick(): void {
     if (tickTimer !== null) return;
     tickTimer = setInterval(() => {
+      const now = Date.now();
+      syncPiCacheWarm();
+      maybeRewarmCache(now);
       footerTui?.requestRender();
       if (MIRROR_TO_TITLE_DURING_PROMPTS && uiPromptActive) refreshPromptTitle();
     }, 1000);
@@ -962,6 +1294,111 @@ export default function promptTimer(pi: ExtensionAPI) {
     if (tickTimer !== null) {
       clearInterval(tickTimer);
       tickTimer = null;
+    }
+  }
+
+  function cancelPendingRewarm(): void {
+    const controller = rewarmAbortController;
+    if (!controller) return;
+    rewarmAbortController = null;
+    controller.abort();
+  }
+
+  function maybeRewarmCache(now: number): void {
+    if (rewarmUntilMs !== null && now >= rewarmUntilMs) {
+      rewarmUntilMs = null;
+      rewarmWindowEnded = true;
+      cancelPendingRewarm();
+    }
+    if (piWarmsCache(rewarmContext?.model)) {
+      rewarmBlocker = null;
+      cancelPendingRewarm();
+      return;
+    }
+    const gates = {
+      agentBusy: thinkingStartMs !== null,
+      uiPromptActive: uiPromptActive || ownOverlayOpen,
+      pendingInput: pendingInputAt !== null,
+    };
+    const idleMs = lastProviderResponseAt === null ? 0 : now - lastProviderResponseAt;
+    const due = rewarmUntilMs !== null && idleMs >= CACHE_TTL_MS - CACHE_REWARM_LEAD_MS && idleMs < CACHE_TTL_MS;
+    rewarmBlocker = due ? rewarmBlockReason(gates) : null;
+    if (
+      rewarmAbortController !== null ||
+      !rewarmContext ||
+      now < rewarmRetryAt ||
+      !shouldRewarmCache({
+        now,
+        rewarmUntilMs,
+        lastProviderResponseAt,
+        lastAttemptAnchorAt: lastRewarmAttemptAnchorAt,
+        ...gates,
+      })
+    ) {
+      return;
+    }
+
+    startRewarm(rewarmContext);
+  }
+
+  function startRewarm(context: ExtensionContext): void {
+    const thinkingLevel = pi.getThinkingLevel();
+    if (!canRewarmReplay(context.model, thinkingLevel)) {
+      rewarmOutcome = "✗ unsupported: budget-based thinking";
+      lastRewarmAttemptAnchorAt = lastProviderResponseAt;
+      return;
+    }
+    lastRewarmAttemptAnchorAt = lastProviderResponseAt;
+    const controller = new AbortController();
+    rewarmAbortController = controller;
+    const activeTools = new Set(pi.getActiveTools());
+    const tools = pi
+      .getAllTools()
+      .filter((tool) => activeTools.has(tool.name))
+      .map(({ name, description, parameters }) => ({ name, description, parameters }));
+    let diffNote = "";
+
+    void rewarmProviderCache(context, tools, controller.signal, {
+      thinkingLevel,
+      sessionId: context.sessionManager.getSessionId(),
+      onPayload: REWARM_DEBUG ? (payload) => { diffNote = recordRewarmDebug(context.cwd, payload); } : undefined,
+    })
+      .then((result) => {
+        if (!result || controller.signal.aborted) return;
+        lastProviderResponseAt = Date.now();
+        lastCachedTokens = result.cacheTokens;
+        lastCacheCostRates = modelCostRates(context);
+        rewarmOutcome =
+          result.cacheRead > 0 ? `✓ cache hit ${result.cacheRead} tok` : `⚠ cache miss (rebuilt)${diffNote}`;
+        footerTui?.requestRender();
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) return;
+        rewarmOutcome = `✗ ${truncatePrompt(stripControlChars(err instanceof Error ? err.message : String(err)))}`;
+        lastRewarmAttemptAnchorAt = null;
+        rewarmRetryAt = Date.now() + REWARM_RETRY_MS;
+        footerTui?.requestRender();
+      })
+      .finally(() => {
+        if (rewarmAbortController === controller) rewarmAbortController = null;
+      });
+  }
+
+  /** Write the real-vs-rewarm payload comparison under .scratch/; returns a footer hint. */
+  function recordRewarmDebug(cwd: string, payload: unknown): string {
+    try {
+      const dir = nodePath.join(cwd, REWARM_DEBUG_DIR);
+      nodeFs.mkdirSync(dir, { recursive: true });
+      const rewarm = summarizePayload(payload);
+      const lines = lastRealPayload
+        ? diffPayloadSummaries(lastRealPayload, rewarm)
+        : ["no real request captured yet in this session"];
+      nodeFs.writeFileSync(nodePath.join(dir, "rewarm-diff.txt"), `${lines.join("\n") || "payloads identical"}\n`);
+      nodeFs.writeFileSync(nodePath.join(dir, "real.json"), JSON.stringify(lastRealPayload ?? {}, null, 2));
+      nodeFs.writeFileSync(nodePath.join(dir, "rewarm.json"), JSON.stringify(rewarm, null, 2));
+      return ` · see ${REWARM_DEBUG_DIR}/rewarm-diff.txt`;
+    } catch {
+      return "";
     }
   }
 
@@ -988,6 +1425,7 @@ export default function promptTimer(pi: ExtensionAPI) {
 
     let result: OverlayResult;
     ownOverlayOpen = true;
+    cancelPendingRewarm();
     try {
       result = await ctx.ui.custom<OverlayResult>(
         (tui, theme, _kb, done) => new TimerHistoryComponent(history, liveEntry, sessionName, tui, theme, done),
@@ -1063,11 +1501,18 @@ export default function promptTimer(pi: ExtensionAPI) {
 
   pi.on("input", async (event) => {
     if (event.source === "extension") return;
+    cancelPendingRewarm();
     pendingPromptText = truncatePrompt(event.text);
     pendingInputAt = Date.now();
+    // The window measures idle time since the last message, so each one restarts it.
+    if (rewarmDurationMs > 0) {
+      rewarmWindowEnded = false;
+      rewarmUntilMs = pendingInputAt + rewarmDurationMs;
+    }
   });
 
   pi.on("agent_start", async () => {
+    cancelPendingRewarm();
     if (thinkingStartMs === null) thinkingStartMs = Date.now();
     footerTui?.requestRender();
     startTick();
@@ -1083,10 +1528,15 @@ export default function promptTimer(pi: ExtensionAPI) {
     lastCacheCostRates = modelCostRates(ctx);
   });
 
+  pi.on("before_provider_request", async (event) => {
+    if (REWARM_DEBUG) lastRealPayload = summarizePayload(event.payload);
+  });
+
   // Blocking user-facing prompt opened/closed (ask_user_question, confirm,
   // select, input, custom overlay). Mirror the cache countdown into the title
   // bar since the footer is occluded by the overlay.
   pi.on("ui_prompt_start", async (_event, ctx) => {
+    cancelPendingRewarm();
     uiPromptActive = true;
     if (MIRROR_TO_TITLE_DURING_PROMPTS && ctx.hasUI) {
       titleUi = ctx.ui;
@@ -1119,6 +1569,13 @@ export default function promptTimer(pi: ExtensionAPI) {
     lastProviderResponseAt = null;
     lastCachedTokens = 0;
     lastCacheCostRates = null;
+    rewarmUntilMs = null;
+    rewarmDurationMs = DEFAULT_REWARM_DURATION_MS;
+    rewarmWindowEnded = false;
+    lastRewarmAttemptAnchorAt = null;
+    rewarmOutcome = null;
+    rewarmBlocker = null;
+    rewarmRetryAt = 0;
     pendingPromptText = "";
     pendingInputAt = null;
     uiPromptActive = false;
@@ -1127,76 +1584,104 @@ export default function promptTimer(pi: ExtensionAPI) {
     // Restore the cache anchor from the transcript so /reload (which preserves
     // context, hence the live prompt cache) keeps the cache-TTL clock ticking.
     // A genuinely new session has no turns, so the footer stays empty (—).
-    const turns = reconstructHistory(ctx.sessionManager.getEntries(), modelCostRates(ctx));
+    const entries = ctx.sessionManager.getEntries();
+    const turns = reconstructHistory(entries, modelCostRates(ctx));
     const lastTurn = turns[turns.length - 1];
-    if (lastTurn) {
-      lastProviderResponseAt = lastTurn.at + lastTurn.durationMs;
-      lastRunMs = lastTurn.durationMs;
-    }
+    if (lastTurn) lastRunMs = lastTurn.durationMs;
+    lastProviderResponseAt = findLastAssistantTimestamp(entries) ?? (lastTurn ? lastTurn.at + lastTurn.durationMs : null);
     const lastUsage = findLastAssistantUsage(ctx.sessionManager.getEntries());
     if (lastUsage) {
       lastCachedTokens = lastUsage.cacheRead + lastUsage.cacheWrite;
       lastCacheCostRates = modelCostRates(ctx);
     }
+    const lastWarm = findLastCacheWarm(entries);
+    if (lastWarm && (lastProviderResponseAt === null || lastWarm.at > lastProviderResponseAt)) {
+      lastProviderResponseAt = lastWarm.at;
+      lastCachedTokens = lastWarm.cacheTokens;
+      lastCacheCostRates = modelCostRates(ctx);
+    }
 
     if (!ctx.hasUI) return;
+    rewarmContext = ctx;
+    rewarmUntilMs = Date.now() + rewarmDurationMs;
+    try {
+      const configPath = nodePath.join(ctx.cwd, REWARM_CONFIG_FILE);
+      const configText = await nodeFs.promises.readFile(configPath, "utf8");
+      rewarmDurationMs = parseRewarmConfig(JSON.parse(configText));
+      rewarmUntilMs = rewarmDurationMs > 0 ? Date.now() + rewarmDurationMs : null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        ctx.ui.notify(`Cache rewarm config ignored: ${(err as Error).message}`, "warning");
+      }
+    }
     titleUi = ctx.ui;
 
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      footerTui = tui;
-      const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
-      startTick();
+    // Own row below the editor (not setFooter), so other extensions' footers and statuses stay intact.
+    const renderTimer = (): void => {
+      const theme = ctx.ui.theme;
+      const now = Date.now();
+      let text: string;
 
-      return {
-        dispose() { unsubBranch(); footerTui = null; },
-        invalidate() {},
-        render(width: number): string[] {
-          const now = Date.now();
-          let left: string;
-
-          if (thinkingStartMs !== null && !uiPromptActive) {
-            // Agent actively working (not blocked on a human prompt).
-            const elapsed = now - thinkingStartMs;
-            left = theme.fg("accent", `⏱  ${formatDuration(elapsed)}  started ${formatTimestamp(thinkingStartMs)}`);
-          } else if (lastProviderResponseAt !== null) {
-            // Idle at prompt, long tool run, or waiting on a human answer — all
-            // expire the cache identically, so show the countdown from the last
-            // provider response.
-            const st = cacheCountdown(lastProviderResponseAt, now);
-            left = theme.fg(st.level, st.text);
-            if (st.level === "error") {
-              const estimate = estimateCacheMissCost(lastCachedTokens, lastCacheCostRates);
-              if (estimate !== null) {
-                left += theme.fg("error", `  · ~${formatEstimatedCost(estimate)} to rebuild`);
-              }
-            }
-            left += theme.fg("dim", `  @${formatTimestamp(lastProviderResponseAt)}`);
-          } else {
-            left = theme.fg("dim", "—");
+      if (thinkingStartMs !== null && !uiPromptActive) {
+        const elapsed = now - thinkingStartMs;
+        text = theme.fg("accent", `⏱  ${formatDuration(elapsed)}  started ${formatTimestamp(thinkingStartMs)}`);
+      } else if (lastProviderResponseAt !== null) {
+        const st = cacheCountdown(lastProviderResponseAt, now);
+        text = theme.fg(st.level, st.text);
+        if (st.level === "error") {
+          const estimate = estimateCacheMissCost(lastCachedTokens, lastCacheCostRates);
+          if (estimate !== null) {
+            text += theme.fg("error", `  · ~${formatEstimatedCost(estimate)} to rebuild`);
           }
+        }
+        text += theme.fg("dim", `  @${formatTimestamp(lastProviderResponseAt)}`);
+      } else {
+        text = theme.fg("dim", "—");
+      }
 
-          if (lastRunMs !== null && thinkingStartMs === null) {
-            left += theme.fg("dim", `   last: ${formatDuration(lastRunMs)}`);
-          }
+      if (lastRunMs !== null && thinkingStartMs === null) {
+        text += theme.fg("dim", `   last: ${formatDuration(lastRunMs)}`);
+      }
 
-          const branch = footerData.getGitBranch();
-          const parts = [ctx.model?.id ?? "", branch ? `(${branch})` : ""].filter(Boolean);
-          const right = parts.length > 0 ? theme.fg("dim", parts.join(" ")) : "";
-          const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(right));
-          return [truncateToWidth(left + " ".repeat(gap) + right, width)];
-        },
-      };
-    });
+      const rewarmLabel = piWarmsCache(rewarmContext?.model)
+        ? "⟳ cache warmed by Pi"
+        : rewarmAbortController !== null
+        ? "⟳ rewarming…"
+        : rewarmUntilMs !== null
+          ? `⟳ rewarm active · ${formatDurationCoarse(Math.max(0, rewarmUntilMs - now))} left`
+          : rewarmWindowEnded
+            ? `⏹ rewarm window ended (${formatDurationCoarse(rewarmDurationMs)})`
+            : null;
+      if (rewarmLabel) {
+        const color = rewarmWindowEnded ? "warning" : "accent";
+        const detail = piWarmsCache(rewarmContext?.model) ? null : rewarmBlocker ? `blocked: ${rewarmBlocker}` : rewarmOutcome;
+        const label = detail && rewarmUntilMs !== null ? `${rewarmLabel} · ${detail}` : rewarmLabel;
+        text = `${theme.fg(color, label)}  · ${text}`;
+      }
+      ctx.ui.setWidget(TIMER_WIDGET_KEY, [text], { placement: "belowEditor" });
+    };
+    footerTui = { requestRender: renderTimer };
+    renderTimer();
+    startTick();
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     stopTick();
     footerTui = null;
     thinkingStartMs = null;
+    rewarmUntilMs = null;
+    rewarmDurationMs = 0;
+    rewarmWindowEnded = false;
+    lastRewarmAttemptAnchorAt = null;
+    rewarmOutcome = null;
+    rewarmBlocker = null;
+    rewarmRetryAt = 0;
+    cancelPendingRewarm();
+    rewarmContext = null;
     uiPromptActive = false;
     ownOverlayOpen = false;
     if (ctx.hasUI) {
-      ctx.ui.setFooter(undefined);
+      ctx.ui.setWidget(TIMER_WIDGET_KEY, undefined);
       if (MIRROR_TO_TITLE_DURING_PROMPTS) ctx.ui.setTitle(baseTitle());
     }
     titleUi = null;
@@ -1205,8 +1690,65 @@ export default function promptTimer(pi: ExtensionAPI) {
   // ── Commands & shortcuts ───────────────────────────────────────────────────
 
   pi.registerCommand("timer", {
-    description: "Show timing history for this session (agent duration per prompt + idle gaps)",
-    handler: (_args, ctx) => showHistory(ctx),
+    description: "Show timing history or configure automatic cache rewarming",
+    handler: async (args, ctx) => {
+      const [subcommand, value, ...extra] = args.trim().split(/\s+/);
+      if (!subcommand) return showHistory(ctx);
+      if (subcommand.toLowerCase() !== "rewarm" || extra.length > 0) {
+        ctx.ui.notify("Usage: /timer [rewarm [<1m..24h|off|status|now>]]", "warning");
+        return;
+      }
+      if (value?.toLowerCase() === "now") {
+        if (piWarmsCache(ctx.model)) {
+          ctx.ui.notify("Pi already warms this model's cache (see /session); rewarm now is not needed.", "info");
+          return;
+        }
+        if (!rewarmContext || rewarmAbortController !== null || thinkingStartMs !== null || lastProviderResponseAt === null) {
+          ctx.ui.notify("Rewarm unavailable: needs an idle session with a completed response.", "warning");
+          return;
+        }
+        startRewarm(rewarmContext);
+        footerTui?.requestRender();
+        return;
+      }
+      if (!value || value.toLowerCase() === "status") {
+        const remaining = rewarmUntilMs === null ? 0 : Math.max(0, rewarmUntilMs - Date.now());
+        ctx.ui.notify(
+          piWarmsCache(ctx.model)
+            ? "Pi warms this model's cache itself; automatic rewarming applies only to models Pi does not warm."
+            : rewarmWindowEnded
+            ? `Automatic cache rewarming window ended after ${formatDurationCoarse(rewarmDurationMs)}.`
+            : remaining > 0
+              ? `Automatic cache rewarming is active for ${formatDuration(remaining)}.`
+              : "Automatic cache rewarming is off.",
+          "info",
+        );
+        return;
+      }
+
+      const durationMs = parseRewarmDuration(value);
+      if (durationMs === null) {
+        ctx.ui.notify('Use /timer rewarm <1m..24h> or /timer rewarm off.', "error");
+        return;
+      }
+      try {
+        await saveRewarmConfig(ctx.cwd, value.toLowerCase());
+        cancelPendingRewarm();
+        rewarmDurationMs = durationMs;
+        rewarmWindowEnded = false;
+        rewarmUntilMs = durationMs > 0 ? Date.now() + durationMs : null;
+        lastRewarmAttemptAnchorAt = null;
+        startTick();
+        ctx.ui.notify(
+          durationMs > 0
+            ? `Automatic cache rewarming enabled for ${value.toLowerCase()}.`
+            : "Automatic cache rewarming is off.",
+          "info",
+        );
+      } catch (err) {
+        ctx.ui.notify(`Could not save cache rewarm config: ${(err as Error).message}`, "error");
+      }
+    },
   });
 
   pi.registerShortcut("ctrl+alt+t", {

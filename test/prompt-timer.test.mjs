@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,16 +12,28 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url, { moduleCache: false });
 const extensionPath = fileURLToPath(new URL("../extensions/prompt-timer/index.ts", import.meta.url));
 const {
+  default: promptTimer,
   formatDuration,
   formatDurationCoarse,
   cacheLevel,
   cacheCountdown,
+  parseRewarmDuration,
+  parseRewarmConfig,
+  shouldRewarmCache,
+  summarizePayload,
+  diffPayloadSummaries,
+  canRewarmReplay,
+  rewarmBlockReason,
+  piWarmsCache,
+  findLastCacheWarm,
+  rewarmProviderCache,
   estimateCacheMissCost,
   formatEstimatedCost,
   truncatePrompt,
   buildDefaultPath,
   reconstructHistory,
   findLastAssistantUsage,
+  findLastAssistantTimestamp,
   stripControlChars,
   resolveWithinCwd,
   renderHistoryMarkdown,
@@ -36,6 +48,229 @@ const {
 } = await jiti.import(extensionPath);
 
 const FIVE_MIN = 5 * 60_000;
+
+test("parseRewarmDuration accepts bounded minute/hour values and off", () => {
+  assert.equal(parseRewarmDuration("1h"), 60 * 60_000);
+  assert.equal(parseRewarmDuration("15m"), 15 * 60_000);
+  assert.equal(parseRewarmDuration("off"), 0);
+  assert.equal(parseRewarmDuration("0m"), null);
+  assert.equal(parseRewarmDuration("25h"), null);
+  assert.equal(parseRewarmDuration("1d"), null);
+});
+
+test("parseRewarmConfig defaults to one hour and validates its value", () => {
+  assert.equal(parseRewarmConfig({}), 60 * 60_000);
+  assert.equal(parseRewarmConfig({ rewarmDuration: "1h" }), 60 * 60_000);
+  assert.equal(parseRewarmConfig({ rewarmDuration: "off" }), 0);
+  assert.throws(() => parseRewarmConfig({ rewarmDuration: "soon" }), /rewarmDuration/);
+  assert.throws(() => parseRewarmConfig([]), /JSON object/);
+});
+
+test("backend-only rewarm calls the provider without changing session entries", async () => {
+  const timestamp = Date.parse("2026-01-01T00:00:00.000Z");
+  const entries = [
+    {
+      type: "message",
+      id: "user-entry",
+      parentId: null,
+      timestamp: new Date(timestamp).toISOString(),
+      message: { role: "user", content: "existing context", timestamp },
+    },
+    {
+      type: "message",
+      id: "assistant-entry",
+      parentId: "user-entry",
+      timestamp: new Date(timestamp + 1_000).toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "prior response" }],
+        api: "mock-api",
+        provider: "mock-provider",
+        model: "mock-model",
+        usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "stop",
+        timestamp: timestamp + 1_000,
+      },
+    },
+  ];
+  const originalEntries = structuredClone(entries);
+  const tool = { name: "read", description: "Read files", parameters: {} };
+  const calls = [];
+  const ctx = {
+    model: { provider: "mock-provider", id: "mock-model" },
+    getSystemPrompt: () => "system prompt",
+    sessionManager: { getBranch: () => entries, getLeafId: () => "assistant-entry" },
+    modelRegistry: {
+      streamSimple: (...args) => {
+        calls.push(args);
+        return { result: async () => ({ stopReason: "stop", usage: { cacheRead: 200, cacheWrite: 3 } }) };
+      },
+    },
+  };
+
+  const warmed = await rewarmProviderCache(ctx, [tool], new AbortController().signal, {
+    thinkingLevel: "high",
+    sessionId: "session-1",
+  });
+
+  assert.deepEqual(warmed, { cacheTokens: 203, cacheRead: 200 });
+  assert.deepEqual(entries, originalEntries);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], ctx.model);
+  assert.equal(calls[0][1].systemPrompt, "system prompt");
+  assert.equal(calls[0][1].messages.length, 3);
+  assert.equal(calls[0][1].messages.at(-1).role, "user");
+  assert.equal(calls[0][1].messages.at(-1).content, ".");
+  assert.deepEqual(calls[0][1].tools, [tool]);
+  assert.equal(calls[0][2].maxTokens, 1);
+  assert.equal(calls[0][2].reasoning, "high");
+  assert.equal(calls[0][2].sessionId, "session-1");
+});
+
+test("scheduled cache rewarming calls the backend without sending a session message", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "prompt-timer-rewarm-"));
+  const originalNow = Date.now;
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  let now = Date.parse("2026-01-01T00:03:46.000Z");
+  const intervals = [];
+  let backendCalls = 0;
+  let sessionMessages = 0;
+  const commands = new Map();
+  const notifications = [];
+  const statuses = new Map();
+  let footerSet = false;
+  const widgets = new Map();
+  Date.now = () => now;
+  globalThis.setInterval = (callback) => (intervals.push(callback), intervals.length);
+  globalThis.clearInterval = () => {};
+
+  const entries = [
+    {
+      type: "message",
+      id: "user-entry",
+      parentId: null,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: "existing context", timestamp: now - 226_000 },
+    },
+    {
+      type: "message",
+      id: "assistant-entry",
+      parentId: "user-entry",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "prior response" }],
+        api: "mock-api",
+        provider: "mock-provider",
+        model: "mock-model",
+        usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 },
+        stopReason: "stop",
+        timestamp: now - 225_000,
+      },
+    },
+  ];
+  const ctx = {
+    hasUI: true,
+    cwd,
+    model: { provider: "mock-provider", id: "mock-model", cost: { input: 1, cacheRead: 0, cacheWrite: 0 } },
+    sessionManager: { getEntries: () => entries, getBranch: () => entries, getLeafId: () => "assistant-entry", getSessionId: () => "session-1" },
+    modelRegistry: {
+      streamSimple: () => {
+        backendCalls++;
+        return { result: async () => ({ stopReason: "stop" }) };
+      },
+    },
+    getSystemPrompt: () => "system prompt",
+    ui: {
+      theme: { fg: (_level, text) => text },
+      setFooter: () => { footerSet = true; },
+      setWidget: (key, lines, options) => (lines === undefined ? widgets.delete(key) : widgets.set(key, { lines, options })),
+      setStatus: (key, text) => (text === undefined ? statuses.delete(key) : statuses.set(key, text)),
+      setTitle() {},
+      notify: (message) => notifications.push(message),
+    },
+  };
+  const handlers = new Map();
+  const pi = {
+    on: (event, handler) => handlers.set(event, handler),
+    registerCommand: (name, command) => commands.set(name, command.handler),
+    registerShortcut() {},
+    getSessionName: () => undefined,
+    getThinkingLevel: () => "off",
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    sendMessage: () => { sessionMessages++; },
+  };
+
+  try {
+    promptTimer(pi);
+    await handlers.get("session_start")({}, ctx);
+    assert.equal(intervals.length, 1);
+    assert.equal(footerSet, false);
+    assert.equal(statuses.size, 0);
+    assert.equal(widgets.get("prompt-timer").options.placement, "belowEditor");
+    const footer = { render: () => widgets.get("prompt-timer")?.lines ?? [] };
+    intervals[0]();
+    assert.match(footer.render(120).join(""), /rewarming/);
+    assert.equal(backendCalls, 1);
+    assert.equal(sessionMessages, 0);
+    assert.equal(entries.length, 2);
+    await new Promise((resolve) => setImmediate(resolve));
+    now += 75_000;
+    intervals[0]();
+    const activeText = footer.render(120).join("");
+    assert.match(activeText, /rewarm active/);
+    assert.match(activeText, /⌛ 1:15/);
+    assert.doesNotMatch(activeText, /cache TTL expired/);
+    now += 60 * 60_000;
+    intervals[0]();
+    const endedText = footer.render(120).join("");
+    assert.match(endedText, /rewarm window ended \(1h\)/);
+    assert.match(endedText, /cache TTL expired/);
+    await commands.get("timer")("rewarm status", ctx);
+    assert.match(notifications.at(-1), /window ended after 1h/);
+    await handlers.get("input")({ source: "interactive", text: "next" }, ctx);
+    intervals[0]();
+    const restartedText = footer.render(120).join("");
+    assert.match(restartedText, /rewarm active · 1h left/);
+    assert.doesNotMatch(restartedText, /window ended/);
+    await handlers.get("session_shutdown")({}, ctx);
+    assert.equal(widgets.has("prompt-timer"), false);
+  } finally {
+    Date.now = originalNow;
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("shouldRewarmCache fires 75 seconds before expiry only while safely idle", () => {
+  const lastProviderResponseAt = 10_000;
+  const rewarmUntilMs = lastProviderResponseAt + 60 * 60_000;
+  const base = {
+    rewarmUntilMs,
+    lastProviderResponseAt,
+    lastAttemptAnchorAt: null,
+    agentBusy: false,
+    uiPromptActive: false,
+    pendingInput: false,
+  };
+
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN - 75_001 }), false);
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN - 75_000 }), true);
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN - 1 }), true);
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN }), false);
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN }), false);
+  assert.equal(shouldRewarmCache({ ...base, now: rewarmUntilMs }), false);
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN - 1, agentBusy: true }), false);
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN - 1, uiPromptActive: true }), false);
+  assert.equal(shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN - 1, pendingInput: true }), false);
+  assert.equal(
+    shouldRewarmCache({ ...base, now: lastProviderResponseAt + FIVE_MIN - 1, lastAttemptAnchorAt: lastProviderResponseAt }),
+    false,
+  );
+});
 
 test("formatDuration renders seconds, m:ss, and h:mm:ss", () => {
   assert.equal(formatDuration(0), "0s");
@@ -118,6 +353,17 @@ test("formatEstimatedCost floors tiny amounts and rounds to cents otherwise", ()
   assert.equal(formatEstimatedCost(1.014), "$1.01");
 });
 
+test("findLastAssistantTimestamp includes hidden rewarm responses", () => {
+  const entries = [
+    { type: "message", timestamp: "2026-01-01T00:00:00.000Z", message: { role: "user" } },
+    { type: "message", timestamp: "2026-01-01T00:00:10.000Z", message: { role: "assistant" } },
+    { type: "custom_message", customType: "prompt-timer-rewarm", display: false },
+    { type: "message", timestamp: "2026-01-01T00:04:00.000Z", message: { role: "assistant" } },
+  ];
+  assert.equal(findLastAssistantTimestamp(entries), Date.parse("2026-01-01T00:04:00.000Z"));
+  assert.equal(findLastAssistantTimestamp([]), null);
+});
+
 test("findLastAssistantUsage returns the most recent assistant message's cache usage", () => {
   const entry = (role, usage) => ({ type: "message", message: { role, usage } });
   assert.equal(findLastAssistantUsage([]), null);
@@ -151,6 +397,39 @@ test("buildDefaultPath picks the extension for the requested export format", () 
   assert.match(buildDefaultPath(undefined, "markdown"), /\.md$/);
   assert.match(buildDefaultPath(undefined, "csv"), /\.csv$/);
   assert.match(buildDefaultPath(undefined, "json"), /\.json$/);
+});
+
+test("reconstructHistory excludes hidden rewarm responses from turn duration", () => {
+  const base = Date.parse("2026-01-01T00:00:00.000Z");
+  const iso = (ms) => new Date(ms).toISOString();
+  const entries = [
+    { type: "message", timestamp: iso(base), message: { role: "user", content: [{ type: "text", text: "work" }] } },
+    { type: "message", timestamp: iso(base + 10_000), message: { role: "assistant", content: "done", usage: { input: 20 } } },
+    { type: "custom_message", customType: "prompt-timer-rewarm", display: false },
+    { type: "message", timestamp: iso(base + 4 * 60_000), message: { role: "assistant", content: ".", usage: { input: 20 } } },
+  ];
+  const [turn] = reconstructHistory(entries);
+  assert.equal(turn.durationMs, 10_000);
+});
+
+test("reconstructHistory uses rewarm responses to avoid false cache-miss badges", () => {
+  const base = Date.parse("2026-01-01T00:00:00.000Z");
+  const iso = (ms) => new Date(ms).toISOString();
+  const user = (ms, text) => ({ type: "message", timestamp: iso(ms), message: { role: "user", content: text } });
+  const assistant = (ms) => ({ type: "message", timestamp: iso(ms), message: { role: "assistant", content: ".", usage: { input: 10 } } });
+  const entries = [
+    user(base, "first"),
+    assistant(base + 10_000),
+    { type: "custom_message", customType: "prompt-timer-rewarm", display: false },
+    assistant(base + 3 * 60_000 + 46_000),
+    user(base + 7 * 60_000, "second"),
+    assistant(base + 7 * 60_000 + 1_000),
+  ];
+
+  const turns = reconstructHistory(entries, { input: 3, cacheRead: 0.3, cacheWrite: 3.75 });
+  assert.equal(turns[0].durationMs, 10_000);
+  assert.equal(turns[1].waitBeforeMs, 6 * 60_000 + 50_000);
+  assert.equal(turns[1].rewarm, undefined);
 });
 
 test("reconstructHistory derives turns, durations, and wait gaps from the transcript", () => {
@@ -542,4 +821,95 @@ test("writeHistoryFile writes inside the project on the normal path", async () =
   await writeHistoryFile(".scratch/history.md", root, [], undefined, "markdown");
   const body = await readFile(join(root, ".scratch", "history.md"), "utf8");
   assert.match(body, /# Timer History/);
+});
+
+test("rewarmProviderCache surfaces provider errors instead of swallowing them", async () => {
+  const ctx = {
+    model: { provider: "mock-provider", id: "mock-model" },
+    getSystemPrompt: () => "system prompt",
+    sessionManager: { getBranch: () => [], getLeafId: () => null },
+    modelRegistry: {
+      streamSimple: () => ({ result: async () => ({ stopReason: "error", errorMessage: "rate limited" }) }),
+    },
+  };
+  await assert.rejects(rewarmProviderCache(ctx, [], new AbortController().signal), /rate limited/);
+});
+
+test("rewarmBlockReason names what is holding a due rewarm back", () => {
+  const idle = { agentBusy: false, uiPromptActive: false, pendingInput: false };
+  assert.equal(rewarmBlockReason(idle), null);
+  assert.equal(rewarmBlockReason({ ...idle, agentBusy: true }), "agent busy");
+  assert.equal(rewarmBlockReason({ ...idle, uiPromptActive: true }), "prompt open");
+  assert.equal(rewarmBlockReason({ ...idle, pendingInput: true }), "input pending");
+});
+
+test("canRewarmReplay rejects only Anthropic budget-based thinking", () => {
+  const anthropic = { api: "anthropic-messages", compat: {} };
+  assert.equal(canRewarmReplay(anthropic, "off"), true);
+  assert.equal(canRewarmReplay(anthropic, "high"), false);
+  assert.equal(canRewarmReplay({ api: "anthropic-messages", compat: { forceAdaptiveThinking: true } }, "high"), true);
+  assert.equal(canRewarmReplay({ api: "openai-responses" }, "high"), true);
+});
+
+test("payload diff ignores cache_control moves and pinpoints real divergences", () => {
+  const user = (text, marked) => ({ role: "user", content: [{ type: "text", text, ...(marked ? { cache_control: { type: "ephemeral" } } : {}) }] });
+  const assistant = { role: "assistant", content: [{ type: "text", text: "ok" }] };
+  const real = summarizePayload({
+    model: "m",
+    thinking: { type: "adaptive" },
+    messages: [user("a"), assistant, user("b", true)],
+  });
+  const same = summarizePayload({
+    model: "m",
+    thinking: { type: "adaptive" },
+    messages: [user("a"), assistant, user("b"), assistant, user(".", true)],
+  });
+  assert.deepEqual(diffPayloadSummaries(real, same), [
+    "messages: real 3 items, rewarm 5; identical prefix 3; cache_control at real [2] rewarm [4]",
+    "  rewarm appends: assistant[text] | user[text] +cache_control",
+  ]);
+
+  const drifted = summarizePayload({ model: "m", messages: [user("a"), assistant, user("changed", true)] });
+  const lines = diffPayloadSummaries(real, drifted);
+  assert.ok(lines.some((line) => line.startsWith("thinking: only in real request")));
+  assert.ok(lines.some((line) => line.includes("first difference @2")));
+});
+
+test("piWarmsCache is true only when the model declares a lifetime for the active retention tier", () => {
+  const saved = process.env.PI_CACHE_RETENTION;
+  try {
+    delete process.env.PI_CACHE_RETENTION;
+    assert.equal(piWarmsCache({ promptCache: { short: 300, long: 3600 } }), true);
+    assert.equal(piWarmsCache({ promptCache: { short: 300 } }), true);
+    assert.equal(piWarmsCache({ promptCache: { long: 3600 } }), false);
+    assert.equal(piWarmsCache({ promptCache: { short: 0 } }), false);
+    assert.equal(piWarmsCache({}), false);
+    assert.equal(piWarmsCache(undefined), false);
+    assert.equal(piWarmsCache(null), false);
+    process.env.PI_CACHE_RETENTION = "long";
+    assert.equal(piWarmsCache({ promptCache: { short: 300 } }), false);
+    assert.equal(piWarmsCache({ promptCache: { long: 3600 } }), true);
+  } finally {
+    if (saved === undefined) delete process.env.PI_CACHE_RETENTION;
+    else process.env.PI_CACHE_RETENTION = saved;
+  }
+});
+
+test("findLastCacheWarm returns only a warm newer than the last assistant message", () => {
+  const assistant = (timestamp) => ({ type: "message", timestamp, message: { role: "assistant" } });
+  const warm = (timestamp, cacheRead, cacheWrite) => ({
+    type: "usage",
+    kind: "cache_warm",
+    timestamp,
+    usage: { cacheRead, cacheWrite },
+  });
+
+  assert.deepEqual(
+    findLastCacheWarm([assistant("2026-01-01T00:00:00Z"), warm("2026-01-01T00:04:00Z", 100, 20), warm("2026-01-01T00:08:00Z", 130, 0)]),
+    { at: Date.parse("2026-01-01T00:08:00Z"), cacheTokens: 130 },
+  );
+  assert.equal(findLastCacheWarm([warm("2026-01-01T00:04:00Z", 100, 0), assistant("2026-01-01T00:05:00Z")]), null);
+  assert.equal(findLastCacheWarm([{ type: "usage", kind: "compaction", timestamp: "2026-01-01T00:04:00Z" }]), null);
+  assert.equal(findLastCacheWarm([{ type: "usage", kind: "cache_warm", timestamp: "not a date" }]), null);
+  assert.equal(findLastCacheWarm([]), null);
 });

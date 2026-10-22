@@ -5,6 +5,20 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Automatic cache rewarming**: enabled by default for one hour after your last message (each message restarts the
+  window), configurable via `/timer rewarm` or `.pi/prompt-timer.json`. It makes a standalone provider request with a
+  temporary one-character prompt 75 seconds before cache expiry, discards the response, and does not change the
+  session transcript. The footer labels the active window, in-flight rewarm, and window expiry. Rewarming pauses
+  during active turns and blocking prompts. The footer reports each rewarm's outcome (cache hit/miss or provider
+  error), names what blocks a due rewarm, and retries failed rewarms every 15 seconds.
+- **Defers to Pi's own cache warmer**: models that declare a cache lifetime (`promptCache`, which Pi's catalog sets only
+  for direct Anthropic, or any model you configure one for) are left to Pi so the cache is never warmed twice. The
+  footer shows `cache warmed by Pi` for them, and `/timer rewarm now` is declined.
+- **Pi's cache warms reset the TTL countdown**: a refresh recorded by Pi's warmer (a `cache_warm` usage entry) now
+  restarts the footer's cache-TTL clock, including after resuming a session.
+
 ### Security
 
 - Prompt previews (history overlay rows, live row, and Markdown/CSV/JSON exports) now have C0/C1 control
@@ -17,6 +31,8 @@ All notable changes are documented here. The format follows
 
 ### Fixed
 
+- The timer no longer replaces the footer. It renders as its own row below the editor, so other extensions' footers
+  and statuses are left intact.
 - History overlay: the in-progress turn no longer renders twice (once as a regular row and again as the live
   row) when the pending prompt's persisted timestamp drifted from the input-event clock.
 - Transcript parsing tolerates string-typed message content (older, headless, RPC-authored, or `/import`ed
